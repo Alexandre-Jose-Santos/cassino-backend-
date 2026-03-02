@@ -408,17 +408,30 @@ io.on('connection', socket => {
   socket.on('join_room', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room) { socket.emit('error', { message: 'Sala não encontrada' }); return; }
-    if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
     if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
 
+    // Verifica se jogador já está na sala (evita duplicata)
+    const jaEstaNaSala = room.players.find(p => p.uid === uid);
+    if (jaEstaNaSala) {
+      // Já está — só manda confirmação
+      socket.join(roomId);
+      socket.emit('room_joined', { room });
+      return;
+    }
+
+    if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
+
     const snap = await db.collection('users').doc(uid).get();
-    if (snap.data().chips < room.betAmount) {
+    if (!snap.exists || snap.data().chips < room.betAmount) {
       socket.emit('error', { message: 'Saldo insuficiente para essa mesa' });
       return;
     }
 
     room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false });
     socket.join(roomId);
+    // Confirma entrada para quem entrou
+    socket.emit('room_joined', { room });
+    // Avisa todos na sala
     io.to(roomId).emit('room_update', room);
     io.to('lobby').emit('rooms_update', getRoomsList());
   });
