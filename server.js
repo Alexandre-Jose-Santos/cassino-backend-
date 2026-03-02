@@ -380,7 +380,9 @@ io.on('connection', socket => {
   io.to('lobby').emit('online_count', io.sockets.sockets.size);
 
   // ── Criar sala ──────────────────────────────────────────
-  socket.on('create_room', async ({ game, betAmount }) => {
+  socket.on('create_room', async ({ game, betAmount, maxPlayers=4 }) => {
+    // Valida maxPlayers
+    const max = Math.min(Math.max(parseInt(maxPlayers)||2, 2), 4);
     // Verifica saldo
     const snap = await db.collection('users').doc(uid).get();
     const balance = snap.data().chips;
@@ -391,7 +393,7 @@ io.on('connection', socket => {
 
     const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
     rooms.set(roomId, {
-      id: roomId, game, betAmount,
+      id: roomId, game, betAmount, maxPlayers: max,
       players: [{ uid, name: user.name, avatar: user.avatar, ready: false }],
       status: 'waiting',
       createdAt: Date.now(),
@@ -406,7 +408,7 @@ io.on('connection', socket => {
   socket.on('join_room', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room) { socket.emit('error', { message: 'Sala não encontrada' }); return; }
-    if (room.players.length >= 4) { socket.emit('error', { message: 'Sala cheia' }); return; }
+    if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
     if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
 
     const snap = await db.collection('users').doc(uid).get();
@@ -430,7 +432,7 @@ io.on('connection', socket => {
     if (player) player.ready = true;
 
     // Se todos prontos e >= 2 jogadores → inicia
-    if (room.players.length >= 2 && room.players.every(p => p.ready)) {
+    if (room.players.length >= 2 && room.players.every(p => p.ready) && room.players.length >= (room.maxPlayers||2)) {
       room.status = 'playing';
 
       // Debita fichas de todos
@@ -533,6 +535,7 @@ function getRoomsList() {
       game:      r.game,
       betAmount: r.betAmount,
       players:   r.players.length,
+      maxPlayers: r.maxPlayers||4,
       createdAt: r.createdAt,
     }));
 }
