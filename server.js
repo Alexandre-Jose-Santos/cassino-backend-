@@ -394,7 +394,7 @@ io.on('connection', socket => {
     const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
     rooms.set(roomId, {
       id: roomId, game, betAmount, maxPlayers: max,
-      players: [{ uid, name: user.name, avatar: user.avatar, ready: false }],
+      players: [{ uid, name: user.name, avatar: user.avatar, ready: false, online: true }],
       status: 'waiting',
       createdAt: Date.now(),
     });
@@ -413,9 +413,13 @@ io.on('connection', socket => {
     // Verifica se jogador já está na sala (evita duplicata)
     const jaEstaNaSala = room.players.find(p => p.uid === uid);
     if (jaEstaNaSala) {
-      // Já está — só manda confirmação
+      // Reconectou — marca como online novamente
+      jaEstaNaSala.online = true;
+      jaEstaNaSala.disconnectedAt = null;
       socket.join(roomId);
       socket.emit('room_joined', { room });
+      io.to(roomId).emit('room_update', room);
+      io.to('lobby').emit('rooms_update', getRoomsList());
       return;
     }
 
@@ -427,7 +431,7 @@ io.on('connection', socket => {
       return;
     }
 
-    room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false });
+    room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
     socket.join(roomId);
     // Confirma entrada para quem entrou
     socket.emit('room_joined', { room });
@@ -522,16 +526,27 @@ io.on('connection', socket => {
   // ── Desconexão ───────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log(`❌ Desconectado: ${user?.name}`);
-    // Remove de salas
+    // Marca jogador como offline mas NÃO remove a sala
+    // A sala só some depois de 5 minutos sem ninguém reconectar
     for (const [roomId, room] of rooms.entries()) {
-      const idx = room.players.findIndex(p => p.uid === uid);
-      if (idx !== -1) {
-        room.players.splice(idx, 1);
-        if (room.players.length === 0) {
-          rooms.delete(roomId);
-        } else {
-          io.to(roomId).emit('player_left', { uid, room });
-        }
+      const player = room.players.find(p => p.uid === uid);
+      if (player) {
+        player.online = false;
+        player.disconnectedAt = Date.now();
+        // Avisa outros na sala
+        io.to(roomId).emit('player_offline', { uid, room });
+        // Agenda limpeza da sala após 5 minutos se ainda vazia/offline
+        setTimeout(() => {
+          const r = rooms.get(roomId);
+          if (!r) return;
+          // Remove jogadores offline há mais de 5 min
+          r.players = r.players.filter(p => p.online || (Date.now() - (p.disconnectedAt||0)) < 300000);
+          if (r.players.length === 0 && r.status === 'waiting') {
+            rooms.delete(roomId);
+            console.log(`🗑️ Sala ${roomId} removida por inatividade`);
+          }
+          io.to('lobby').emit('rooms_update', getRoomsList());
+        }, 300000); // 5 minutos
       }
     }
     io.to('lobby').emit('online_count', io.sockets.sockets.size);
@@ -544,12 +559,13 @@ function getRoomsList() {
   return [...rooms.values()]
     .filter(r => r.status === 'waiting')
     .map(r => ({
-      id:        r.id,
-      game:      r.game,
-      betAmount: r.betAmount,
-      players:   r.players.length,
+      id:         r.id,
+      game:       r.game,
+      betAmount:  r.betAmount,
+      players:    r.players.length,
       maxPlayers: r.maxPlayers||4,
-      createdAt: r.createdAt,
+      createdAt:  r.createdAt,
+      hasOffline: r.players.some(p => !p.online),
     }));
 }
 
