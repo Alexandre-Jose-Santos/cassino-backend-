@@ -443,25 +443,52 @@ io.on('connection', socket => {
   // ── Player pronto ──────────────────────────────────────
   socket.on('player_ready', async ({ roomId }) => {
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room || room.status !== 'waiting') return;
 
     const player = room.players.find(p => p.uid === uid);
-    if (player) player.ready = true;
+    if (!player) return;
+    
+    // Evita marcar pronto duas vezes
+    if (player.ready) return;
+    player.ready = true;
 
-    // Se todos prontos e >= 2 jogadores → inicia
-    if (room.players.length >= 2 && room.players.every(p => p.ready) && room.players.length >= (room.maxPlayers||2)) {
+    const totalProntos = room.players.filter(p => p.ready).length;
+    const totalJogadores = room.players.length;
+
+    // Precisa de todos prontos E sala cheia (mínimo 2)
+    const salaCheiaOuPronta = totalJogadores >= 2 && totalProntos === totalJogadores;
+
+    if (salaCheiaOuPronta) {
       room.status = 'playing';
 
-      // Debita fichas de todos
-      const batch = db.batch();
-      for (const p of room.players) {
-        batch.update(db.collection('users').doc(p.uid), {
-          chips: admin.firestore.FieldValue.increment(-room.betAmount),
-        });
+      // Debita fichas UMA VEZ de cada jogador
+      try {
+        const batch = db.batch();
+        for (const p of room.players) {
+          const snap = await db.collection('users').doc(p.uid).get();
+          const saldo = snap.exists ? (snap.data().chips || 0) : 0;
+          if (saldo < room.betAmount) {
+            // Saldo insuficiente — cancela e volta para waiting
+            room.status = 'waiting';
+            room.players.forEach(pl => pl.ready = false);
+            io.to(roomId).emit('error', { message: `${p.name} não tem fichas suficientes!` });
+            io.to(roomId).emit('room_update', room);
+            return;
+          }
+          batch.update(db.collection('users').doc(p.uid), {
+            chips: admin.firestore.FieldValue.increment(-room.betAmount),
+          });
+        }
+        await batch.commit();
+      } catch(e) {
+        console.error('Erro ao debitar fichas:', e);
+        room.status = 'waiting';
+        room.players.forEach(pl => pl.ready = false);
+        io.to(roomId).emit('room_update', room);
+        return;
       }
-      await batch.commit();
 
-      // Cria registro da partida no Firestore
+      // Cria registro da partida
       const matchRef = await db.collection('matches').add({
         roomId,
         game:      room.game,
@@ -474,7 +501,9 @@ io.on('connection', socket => {
       room.matchId = matchRef.id;
 
       io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
+      console.log(`🎮 Jogo iniciado: ${room.game} sala ${roomId} — ${totalJogadores} jogadores`);
     } else {
+      // Atualiza sala para mostrar quem está pronto
       io.to(roomId).emit('room_update', room);
     }
   });
@@ -513,6 +542,11 @@ io.on('connection', socket => {
     io.to(roomId).emit('game_result', { winnerId, prize, room });
     rooms.delete(roomId);
     io.to('lobby').emit('rooms_update', getRoomsList());
+  });
+
+  // ── Atualiza lista de salas sob demanda ──────────────────
+  socket.on('get_rooms', () => {
+    socket.emit('rooms_update', getRoomsList());
   });
 
   // ── Chat da sala ─────────────────────────────────────────
