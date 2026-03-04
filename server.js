@@ -735,6 +735,47 @@ io.on('connection', socket => {
     });
   });
 
+  // ── Rematch ──────────────────────────────────────────────
+  socket.on('rematch_vote', ({ roomId, accept }) => {
+    const room = rooms.get(roomId);
+    if(!room) return;
+
+    // Inicializa votos se necessário
+    if(!room.rematchVotes) room.rematchVotes = {};
+    room.rematchVotes[uid] = accept;
+
+    const total = room.players.length;
+    const voter = room.players.find(p => p.uid === uid);
+
+    // Notifica todos da sala
+    io.to(roomId).emit('rematch_vote', {
+      uid, name: voter?.name || 'Jogador',
+      accept,
+      votes: room.rematchVotes,
+      total,
+    });
+
+    const allVoted = Object.keys(room.rematchVotes).length === total;
+    const allAccepted = allVoted && Object.values(room.rematchVotes).every(Boolean);
+    const anyRejected = Object.values(room.rematchVotes).some(v => v === false);
+
+    if(allAccepted) {
+      // Reinicia sala para nova partida
+      room.status = 'waiting';
+      room.rematchVotes = {};
+      room.pifeState = null;
+      room.matchId = null;
+      room.players.forEach(p => p.ready = false);
+      io.to('lobby').emit('rooms_update', getRoomsList());
+    } else if(anyRejected) {
+      // Alguém recusou — remove sala após 3s
+      setTimeout(() => {
+        rooms.delete(roomId);
+        io.to('lobby').emit('rooms_update', getRoomsList());
+      }, 3000);
+    }
+  });
+
   // ── Desconexão ───────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log(`❌ Desconectado: ${user?.name}`);
