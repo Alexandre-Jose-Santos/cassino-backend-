@@ -441,71 +441,90 @@ io.on('connection', socket => {
   });
 
   // ── Player pronto ──────────────────────────────────────
-  socket.on('player_ready', async ({ roomId }) => {
+  // ── Player pronto (só marca ready, NÃO debita fichas) ────
+  socket.on('player_ready', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'waiting') return;
+    const player = room.players.find(p => p.uid === uid);
+    if (!player || player.ready) return;
+    player.ready = true;
+    io.to(roomId).emit('room_update', room);
+  });
+
+  // ── Cancelar pronto ────────────────────────────────────────
+  socket.on('player_unready', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'waiting') return;
+    const player = room.players.find(p => p.uid === uid);
+    if (!player) return;
+    player.ready = false;
+    io.to(roomId).emit('room_update', room);
+  });
+
+  // ── Iniciar jogo (só o criador, quando todos prontos) ─────
+  // Débito acontece AQUI, não no player_ready
+  socket.on('start_game', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'waiting') return;
 
-    const player = room.players.find(p => p.uid === uid);
-    if (!player) return;
-    
-    // Evita marcar pronto duas vezes
-    if (player.ready) return;
-    player.ready = true;
-
-    const totalProntos = room.players.filter(p => p.ready).length;
-    const totalJogadores = room.players.length;
-
-    // Precisa de todos prontos E sala cheia (mínimo 2)
-    const salaCheiaOuPronta = totalJogadores >= 2 && totalProntos === totalJogadores;
-
-    if (salaCheiaOuPronta) {
-      room.status = 'playing';
-
-      // Debita fichas UMA VEZ de cada jogador
-      try {
-        const batch = db.batch();
-        for (const p of room.players) {
-          const snap = await db.collection('users').doc(p.uid).get();
-          const saldo = snap.exists ? (snap.data().chips || 0) : 0;
-          if (saldo < room.betAmount) {
-            // Saldo insuficiente — cancela e volta para waiting
-            room.status = 'waiting';
-            room.players.forEach(pl => pl.ready = false);
-            io.to(roomId).emit('error', { message: `${p.name} não tem fichas suficientes!` });
-            io.to(roomId).emit('room_update', room);
-            return;
-          }
-          batch.update(db.collection('users').doc(p.uid), {
-            chips: admin.firestore.FieldValue.increment(-room.betAmount),
-          });
-        }
-        await batch.commit();
-      } catch(e) {
-        console.error('Erro ao debitar fichas:', e);
-        room.status = 'waiting';
-        room.players.forEach(pl => pl.ready = false);
-        io.to(roomId).emit('room_update', room);
-        return;
-      }
-
-      // Cria registro da partida
-      const matchRef = await db.collection('matches').add({
-        roomId,
-        game:      room.game,
-        betAmount: room.betAmount,
-        pot:       room.betAmount * room.players.length,
-        players:   room.players.map(p => p.uid),
-        status:    'playing',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      room.matchId = matchRef.id;
-
-      io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
-      console.log(`🎮 Jogo iniciado: ${room.game} sala ${roomId} — ${totalJogadores} jogadores`);
-    } else {
-      // Atualiza sala para mostrar quem está pronto
-      io.to(roomId).emit('room_update', room);
+    // Só o criador (primeiro jogador) pode iniciar
+    if (room.players[0].uid !== uid) {
+      socket.emit('error', { message: 'Só quem criou a sala pode iniciar.' });
+      return;
     }
+
+    const totalJogadores = room.players.length;
+    if (totalJogadores < 2) {
+      socket.emit('error', { message: 'Precisa de pelo menos 2 jogadores.' });
+      return;
+    }
+
+    const nProntos = room.players.filter(p => p.ready).length;
+    if (nProntos < totalJogadores) {
+      socket.emit('error', { message: 'Nem todos os jogadores estão prontos.' });
+      return;
+    }
+
+    room.status = 'playing';
+
+    // Debita fichas de todos agora
+    try {
+      const batch = db.batch();
+      for (const p of room.players) {
+        const snap = await db.collection('users').doc(p.uid).get();
+        const saldo = snap.exists ? (snap.data().chips || 0) : 0;
+        if (saldo < room.betAmount) {
+          room.status = 'waiting';
+          room.players.forEach(pl => pl.ready = false);
+          io.to(roomId).emit('error', { message: `${p.name} não tem fichas suficientes (${saldo}/${room.betAmount})!` });
+          io.to(roomId).emit('room_update', room);
+          return;
+        }
+        batch.update(db.collection('users').doc(p.uid), {
+          chips: admin.firestore.FieldValue.increment(-room.betAmount),
+        });
+      }
+      await batch.commit();
+    } catch(e) {
+      console.error('Erro ao debitar:', e);
+      room.status = 'waiting';
+      room.players.forEach(pl => pl.ready = false);
+      io.to(roomId).emit('room_update', room);
+      return;
+    }
+
+    const matchRef = await db.collection('matches').add({
+      roomId, game: room.game,
+      betAmount: room.betAmount,
+      pot: room.betAmount * totalJogadores,
+      players: room.players.map(p => p.uid),
+      status: 'playing',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    room.matchId = matchRef.id;
+
+    io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
+    console.log(`🎮 Jogo iniciado: ${room.game} sala ${roomId} — ${totalJogadores} jogadores`);
   });
 
   // ── Ação de jogo (genérico) ────────────────────────────
