@@ -591,8 +591,37 @@ io.on('connection', socket => {
       return;
     }
 
-    // ── Pife: declarar pife ──
+    // ── Pife: declarar pife (valida no servidor) ──
     if(action === 'pife_declare') {
+      const hand = data.hand || [];
+      if(hand.length !== 9){ socket.emit('game_action',{uid:'server',action:'pife_invalid',data:{}}); return; }
+      // Valida grupos
+      const vals={'A':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13};
+      const isGroup=(g)=>{
+        if(g.length!==3)return false;
+        if(g[0].rank===g[1].rank&&g[1].rank===g[2].rank)return true;
+        if(g[0].suit===g[1].suit&&g[1].suit===g[2].suit){
+          const v=g.map(c=>vals[c.rank]).sort((a,b)=>a-b);
+          if(v[1]===v[0]+1&&v[2]===v[1]+1)return true;
+          if(JSON.stringify(v)==='[1,12,13]')return true;
+        }
+        return false;
+      };
+      const check=(rem,groups)=>{
+        if(groups===3)return rem.length===0;
+        if(rem.length<3)return false;
+        for(let i=1;i<rem.length;i++){
+          for(let j=i+1;j<rem.length;j++){
+            const g=[rem[0],rem[i],rem[j]];
+            if(isGroup(g)){
+              const rest=rem.filter((_,idx)=>idx!==0&&idx!==i&&idx!==j);
+              if(check(rest,groups+1))return true;
+            }
+          }
+        }
+        return false;
+      };
+      if(!check(hand,0)){ socket.emit('game_action',{uid:'server',action:'pife_invalid',data:{}}); return; }
       const winnerId=uid;
       const loserId=room?.players.find(p=>p.uid!==uid)?.uid;
       io.to(roomId).emit('game_action',{uid:'server',action:'pife_win',data:{winnerId,loserId}});
