@@ -660,7 +660,110 @@ io.on('connection', socket => {
       return;
     }
 
-        // Dados e outros jogos: repassa ação direto
+        // ── Dominó Online ─────────────────────────────────────────
+    if(action === 'domino_init') {
+      if(!room) return;
+      if(!room.dominoState) {
+        // Gera 28 peças de dominó [0-0 até 6-6]
+        let pieces=[];
+        for(let a=0;a<=6;a++) for(let b=a;b<=6;b++) pieces.push({a,b});
+        // Embaralha
+        for(let i=pieces.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pieces[i],pieces[j]]=[pieces[j],pieces[i]];}
+        const hands={};
+        for(const p of room.players) hands[p.uid]=pieces.splice(0,7);
+        room.dominoState={hands,board:[],boardEnds:{left:null,right:null},currentTurn:room.players[0].uid,passCount:0};
+      }
+      for(const p of room.players){
+        const pSock=[...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+        if(pSock){
+          const opp=Object.entries(room.dominoState.hands).find(([k])=>k!==p.uid);
+          pSock.emit('game_action',{uid:'server',action:'domino_state',data:{
+            hand:room.dominoState.hands[p.uid],
+            board:room.dominoState.board,
+            boardEnds:room.dominoState.boardEnds,
+            oppCount:opp?.[1]?.length||7,
+            myTurn:room.dominoState.currentTurn===p.uid,
+          }});
+        }
+      }
+      return;
+    }
+
+    if(action === 'domino_play' && room?.dominoState) {
+      const ds=room.dominoState;
+      if(ds.currentTurn!==uid) return;
+      const {piece,handIdx,side}=data;
+      // Coloca na mesa
+      let newPiece={...piece};
+      if(ds.board.length===0){
+        ds.board.push(newPiece);
+        ds.boardEnds={left:newPiece.a,right:newPiece.b};
+      } else if(side==='left'){
+        if(newPiece.b!==ds.boardEnds.left) newPiece={a:newPiece.b,b:newPiece.a};
+        ds.board.unshift(newPiece);
+        ds.boardEnds.left=newPiece.a;
+      } else {
+        if(newPiece.a!==ds.boardEnds.right) newPiece={a:newPiece.b,b:newPiece.a};
+        ds.board.push(newPiece);
+        ds.boardEnds.right=newPiece.b;
+      }
+      // Remove da mão
+      ds.hands[uid].splice(handIdx,1);
+      ds.passCount=0;
+      // Próximo turno
+      const pidx=room.players.findIndex(p=>p.uid===uid);
+      ds.currentTurn=room.players[(pidx+1)%room.players.length].uid;
+      io.to(roomId).emit('game_action',{uid,action:'domino_played',data:{board:ds.board,boardEnds:ds.boardEnds,handIdx}});
+      // Verifica vitória (mão vazia)
+      if(ds.hands[uid].length===0){
+        const loserId=room.players.find(p=>p.uid!==uid)?.uid;
+        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:uid,loserId}});
+        // Debita/credita
+        const bet=room.betAmount||0;
+        if(bet>0&&loserId){
+          (async()=>{
+            try{
+              const lSnap=await db.collection('users').doc(loserId).get();
+              const lChips=lSnap.exists?(lSnap.data().chips||0):0;
+              const debit=Math.min(bet,Math.max(0,lChips));
+              if(debit>0){
+                const batch=db.batch();
+                batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
+                batch.update(db.collection('users').doc(uid),{chips:admin.firestore.FieldValue.increment(debit)});
+                await batch.commit();
+                await logTransaction(uid,'win',debit,`Dominó — vitória`);
+                await logTransaction(loserId,'loss',-debit,`Dominó — derrota`);
+                const [wS,lS]=await Promise.all([db.collection('users').doc(uid).get(),db.collection('users').doc(loserId).get()]);
+                io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              }
+            }catch(e){console.error('Erro dominó:',e);}
+          })();
+        }
+      }
+      return;
+    }
+
+    if(action === 'domino_pass' && room?.dominoState) {
+      const ds=room.dominoState;
+      if(ds.currentTurn!==uid) return;
+      ds.passCount=(ds.passCount||0)+1;
+      const pidx=room.players.findIndex(p=>p.uid===uid);
+      ds.currentTurn=room.players[(pidx+1)%room.players.length].uid;
+      io.to(roomId).emit('game_action',{uid,action:'domino_pass',data:{}});
+      // Dois passes seguidos = fechado, quem tem menos pontos ganha
+      if(ds.passCount>=room.players.length){
+        let winner=null,minPts=Infinity;
+        for(const p of room.players){
+          const pts=ds.hands[p.uid].reduce((s,pc)=>s+pc.a+pc.b,0);
+          if(pts<minPts){minPts=pts;winner=p.uid;}
+        }
+        const loser=room.players.find(p=>p.uid!==winner)?.uid;
+        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:winner,loserId:loser}});
+      }
+      return;
+    }
+
+    // Outros jogos: repassa direto
     socket.to(roomId).emit('game_action', { uid, action, data });
   });
 
@@ -760,12 +863,32 @@ io.on('connection', socket => {
     const anyRejected = Object.values(room.rematchVotes).some(v => v === false);
 
     if(allAccepted) {
-      // Reinicia sala para nova partida
+      // Verifica saldo de todos antes de reiniciar
+      if(room.betAmount > 0) {
+        let semSaldo = null;
+        for(const p of room.players) {
+          const snap = await db.collection('users').doc(p.uid).get();
+          const chips = snap.exists ? (snap.data().chips || 0) : 0;
+          if(chips < room.betAmount) { semSaldo = {name: p.name, chips, needed: room.betAmount}; break; }
+        }
+        if(semSaldo) {
+          io.to(roomId).emit('rematch_blocked', {
+            message: `❌ ${semSaldo.name} tem apenas ${semSaldo.chips} fichas e a aposta é ${semSaldo.needed}. Reduza a aposta ou saia.`,
+            playerName: semSaldo.name,
+            chips: semSaldo.chips,
+            needed: semSaldo.needed,
+          });
+          room.rematchVotes = {};
+          return;
+        }
+      }
+      // Reinicia sala
       room.status = 'waiting';
       room.rematchVotes = {};
       room.pifeState = null;
       room.matchId = null;
       room.players.forEach(p => p.ready = false);
+      io.to(roomId).emit('rematch_ok', {});
       io.to('lobby').emit('rooms_update', getRoomsList());
     } else if(anyRejected) {
       // Alguém recusou — remove sala após 3s
