@@ -425,12 +425,6 @@ io.on('connection', socket => {
 
     if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
 
-    const snap = await db.collection('users').doc(uid).get();
-    if (!snap.exists || snap.data().chips < room.betAmount) {
-      socket.emit('error', { message: 'Saldo insuficiente para essa mesa' });
-      return;
-    }
-
     room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
     socket.join(roomId);
     // Confirma entrada para quem entrou
@@ -441,7 +435,7 @@ io.on('connection', socket => {
   });
 
   // ── Player pronto ──────────────────────────────────────
-  // ── Player pronto (só marca ready, NÃO debita fichas) ────
+  // ── Player pronto ─────────────────────────────────────────
   socket.on('player_ready', ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'waiting') return;
@@ -451,7 +445,6 @@ io.on('connection', socket => {
     io.to(roomId).emit('room_update', room);
   });
 
-  // ── Cancelar pronto ────────────────────────────────────────
   socket.on('player_unready', ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'waiting') return;
@@ -461,70 +454,65 @@ io.on('connection', socket => {
     io.to(roomId).emit('room_update', room);
   });
 
-  // ── Iniciar jogo (só o criador, quando todos prontos) ─────
-  // Débito acontece AQUI, não no player_ready
+  // ── Iniciar jogo (criador, todos prontos) — SEM debitar fichas ──
   socket.on('start_game', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'waiting') return;
-
-    // Só o criador (primeiro jogador) pode iniciar
     if (room.players[0].uid !== uid) {
       socket.emit('error', { message: 'Só quem criou a sala pode iniciar.' });
       return;
     }
-
-    const totalJogadores = room.players.length;
-    if (totalJogadores < 2) {
+    if (room.players.length < 2) {
       socket.emit('error', { message: 'Precisa de pelo menos 2 jogadores.' });
       return;
     }
-
-    const nProntos = room.players.filter(p => p.ready).length;
-    if (nProntos < totalJogadores) {
-      socket.emit('error', { message: 'Nem todos os jogadores estão prontos.' });
+    if (!room.players.every(p => p.ready)) {
+      socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
-
     room.status = 'playing';
-
-    // Debita fichas de todos agora
-    try {
-      const batch = db.batch();
-      for (const p of room.players) {
-        const snap = await db.collection('users').doc(p.uid).get();
-        const saldo = snap.exists ? (snap.data().chips || 0) : 0;
-        if (saldo < room.betAmount) {
-          room.status = 'waiting';
-          room.players.forEach(pl => pl.ready = false);
-          io.to(roomId).emit('error', { message: `${p.name} não tem fichas suficientes (${saldo}/${room.betAmount})!` });
-          io.to(roomId).emit('room_update', room);
-          return;
-        }
-        batch.update(db.collection('users').doc(p.uid), {
-          chips: admin.firestore.FieldValue.increment(-room.betAmount),
-        });
-      }
-      await batch.commit();
-    } catch(e) {
-      console.error('Erro ao debitar:', e);
-      room.status = 'waiting';
-      room.players.forEach(pl => pl.ready = false);
-      io.to(roomId).emit('room_update', room);
-      return;
-    }
-
     const matchRef = await db.collection('matches').add({
       roomId, game: room.game,
       betAmount: room.betAmount,
-      pot: room.betAmount * totalJogadores,
       players: room.players.map(p => p.uid),
       status: 'playing',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     room.matchId = matchRef.id;
-
     io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
-    console.log(`🎮 Jogo iniciado: ${room.game} sala ${roomId} — ${totalJogadores} jogadores`);
+    console.log(`🎮 Jogo: ${room.game} sala ${roomId}`);
+  });
+
+  // ── Proposta de mudança de aposta (durante o jogo) ────────
+  socket.on('propose_bet', ({ roomId, newBet }) => {
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'playing') return;
+    const proposer = room.players.find(p => p.uid === uid);
+    if (!proposer) return;
+    // Qualquer jogador pode propor
+    room.pendingBet = { value: newBet, proposedBy: uid, proposerName: proposer.name, votes: {[uid]: true}, proposedAt: Date.now() };
+    // Avisa TODOS os outros
+    socket.to(roomId).emit('bet_proposal', { newBet, proposedBy: proposer.name });
+  });
+
+  socket.on('vote_bet', ({ roomId, accept }) => {
+    const room = rooms.get(roomId);
+    if (!room || !room.pendingBet) return;
+    room.pendingBet.votes[uid] = accept;
+    const others = room.players.filter(p => p.uid !== room.players[0].uid);
+    const allVoted = others.every(p => room.pendingBet.votes[p.uid] !== undefined);
+    if (allVoted) {
+      const allAccepted = others.every(p => room.pendingBet.votes[p.uid] === true);
+      if (allAccepted) {
+        room.betAmount = room.pendingBet.value;
+        io.to(roomId).emit('bet_changed', { newBet: room.betAmount });
+      } else {
+        io.to(roomId).emit('bet_rejected', { newBet: room.pendingBet.value });
+      }
+      room.pendingBet = null;
+    } else {
+      io.to(roomId).emit('room_update', room);
+    }
   });
 
   // ── Ação de jogo (genérico) ────────────────────────────
@@ -534,31 +522,59 @@ io.on('connection', socket => {
   });
 
   // ── Fim de jogo ─────────────────────────────────────────
-  socket.on('game_over', async ({ roomId, winnerId }) => {
+  socket.on('game_over', async ({ roomId, winnerId, loserId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'playing') return;
     room.status = 'finished';
 
-    const pot     = room.betAmount * room.players.length;
-    const prize   = pot; // fichas virtuais — sem taxa aqui (taxa só no saque)
+    const bet = room.betAmount || 0;
 
-    // Credita vencedor
-    if (winnerId) {
-      await db.collection('users').doc(winnerId).update({
-        chips: admin.firestore.FieldValue.increment(prize),
-      });
-      await logTransaction(winnerId, 'win', prize, `Vitória em ${room.game} — pote R$${pot}`);
+    // Debita do perdedor e credita no vencedor
+    if (bet > 0 && winnerId && loserId && winnerId !== loserId) {
+      try {
+        const batch = db.batch();
+        // Verifica saldo do perdedor
+        const loserSnap = await db.collection('users').doc(loserId).get();
+        const loserChips = loserSnap.exists ? (loserSnap.data().chips || 0) : 0;
+        const debit = Math.min(bet, loserChips); // nunca vai negativo
+
+        if (debit > 0) {
+          batch.update(db.collection('users').doc(loserId), {
+            chips: admin.firestore.FieldValue.increment(-debit),
+          });
+          batch.update(db.collection('users').doc(winnerId), {
+            chips: admin.firestore.FieldValue.increment(debit),
+          });
+          await batch.commit();
+          await logTransaction(winnerId, 'win',  debit, `Vitória em ${room.game}`);
+          await logTransaction(loserId,  'loss', -debit, `Derrota em ${room.game}`);
+        }
+
+        // Notifica resultado com saldos atualizados
+        const [wSnap, lSnap] = await Promise.all([
+          db.collection('users').doc(winnerId).get(),
+          db.collection('users').doc(loserId).get(),
+        ]);
+        io.to(roomId).emit('game_result', {
+          winnerId, loserId, prize: debit,
+          winnerChips: wSnap.data()?.chips || 0,
+          loserChips:  lSnap.data()?.chips || 0,
+        });
+      } catch(e) {
+        console.error('Erro ao processar resultado:', e);
+        io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
+      }
+    } else {
+      io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
     }
 
-    // Atualiza partida
     if (room.matchId) {
       await db.collection('matches').doc(room.matchId).update({
-        status: 'finished', winnerId, prize,
+        status: 'finished', winnerId, loserId,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      }).catch(()=>{});
     }
 
-    io.to(roomId).emit('game_result', { winnerId, prize, room });
     rooms.delete(roomId);
     io.to('lobby').emit('rooms_update', getRoomsList());
   });
