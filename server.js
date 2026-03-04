@@ -624,7 +624,39 @@ io.on('connection', socket => {
       if(!check(hand,0)){ socket.emit('game_action',{uid:'server',action:'pife_invalid',data:{}}); return; }
       const winnerId=uid;
       const loserId=room?.players.find(p=>p.uid!==uid)?.uid;
-      io.to(roomId).emit('game_action',{uid:'server',action:'pife_win',data:{winnerId,loserId}});
+      // Envia mãos de todos para revelação final
+      const allHands={};
+      for(const p of room.players) allHands[p.uid]={hand:room.pifeState?.hands[p.uid]||[],name:p.name};
+      io.to(roomId).emit('game_action',{uid:'server',action:'pife_win',data:{winnerId,loserId,allHands}});
+      // Processa débito/crédito via game_over
+      const bet=room.betAmount||0;
+      if(bet>0&&winnerId&&loserId){
+        (async()=>{
+          try{
+            const loserSnap=await db.collection('users').doc(loserId).get();
+            const loserChips=loserSnap.exists?(loserSnap.data().chips||0):0;
+            const debit=Math.min(bet,Math.max(0,loserChips));
+            if(debit>0){
+              const batch=db.batch();
+              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
+              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
+              await batch.commit();
+              await logTransaction(winnerId,'win',debit,`Pife — ganhou de ${room.players.find(p=>p.uid===loserId)?.name}`);
+              await logTransaction(loserId,'loss',-debit,`Pife — perdeu para ${room.players.find(p=>p.uid===winnerId)?.name}`);
+              // Notifica saldos atualizados
+              const [wSnap,lSnap]=await Promise.all([
+                db.collection('users').doc(winnerId).get(),
+                db.collection('users').doc(loserId).get(),
+              ]);
+              io.to(roomId).emit('game_result',{
+                winnerId,loserId,prize:debit,
+                winnerChips:wSnap.data()?.chips||0,
+                loserChips:lSnap.data()?.chips||0,
+              });
+            }
+          }catch(e){console.error('Erro ao processar pife:',e);}
+        })();
+      }
       return;
     }
 
