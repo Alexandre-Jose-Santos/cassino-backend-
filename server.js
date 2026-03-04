@@ -519,44 +519,31 @@ io.on('connection', socket => {
   socket.on('game_action', ({ roomId, action, data }) => {
     const room = rooms.get(roomId);
 
-    // ── Pife Online: inicializa baralho e distribui cartas ──
+    // ── Pife Online: inicializa ──
     if(action === 'pife_init') {
       if(!room) return;
-      // Só inicia uma vez (quem chega primeiro)
-      if(room.pifeState) {
-        // Jogador chegou depois — envia estado já existente
-        const myHand = room.pifeState.hands[uid] || [];
-        socket.emit('game_action', { uid: 'server', action: 'pife_state', data: {
-          hand: myHand,
-          discard: room.pifeState.discardPile.slice(0,1),
-          deckCount: room.pifeState.deck.length,
-          myTurn: room.pifeState.currentTurn === uid,
-          oppHandSize: Object.entries(room.pifeState.hands).find(([k])=>k!==uid)?.[1]?.length || 9,
-        }});
-        return;
+      if(!room.pifeState) {
+        // Cria e embaralha baralho
+        const suits=['♠','♥','♦','♣'], ranks=['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+        let deck=[];
+        for(const su of suits) for(const r of ranks) deck.push({rank:r,suit:su});
+        for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
+        const hands={};
+        for(const p of room.players) hands[p.uid]=deck.splice(0,9);
+        const discardPile=[deck.splice(0,1)[0]];
+        room.pifeState={deck,hands,discardPile,currentTurn:room.players[0].uid};
       }
-      // Cria baralho
-      const suits=['♠','♥','♦','♣'], ranks=['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
-      let deck=[];
-      for(const s of suits) for(const r of ranks) deck.push({rank:r,suit:s});
-      // Embaralha
-      for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
-      // Distribui 9 cartas para cada jogador
-      const hands={};
-      for(const p of room.players){ hands[p.uid]=deck.splice(0,9); }
-      const discardPile=[deck.splice(0,1)[0]];
-      const firstTurn = room.players[0].uid;
-      room.pifeState = { deck, hands, discardPile, currentTurn: firstTurn, started: true };
-      // Envia estado individual para cada jogador
+      // Envia estado individual para cada jogador conectado
       for(const p of room.players){
-        const pSocket=[...io.sockets.sockets.values()].find(s=>s.data.uid===p.uid);
-        if(pSocket){
-          pSocket.emit('game_action',{uid:'server',action:'pife_state',data:{
-            hand: hands[p.uid],
-            discard: discardPile,
-            deckCount: deck.length,
-            myTurn: p.uid===firstTurn,
-            oppHandSize: Object.entries(hands).find(([k])=>k!==p.uid)?.[1]?.length||9,
+        const pSock=[...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+        if(pSock){
+          const others=Object.entries(room.pifeState.hands).find(([k])=>k!==p.uid);
+          pSock.emit('game_action',{uid:'server',action:'pife_state',data:{
+            hand: room.pifeState.hands[p.uid],
+            discard: room.pifeState.discardPile,
+            deckCount: room.pifeState.deck.length,
+            myTurn: room.pifeState.currentTurn===p.uid,
+            oppHandSize: others?.[1]?.length||9,
           }});
         }
       }
@@ -565,49 +552,54 @@ io.on('connection', socket => {
 
     // ── Pife: comprar carta ──
     if(action === 'pife_draw' && room?.pifeState) {
-      const ps = room.pifeState;
-      if(ps.currentTurn !== uid) return;
+      const ps=room.pifeState;
+      if(ps.currentTurn!==uid) return;
       let card;
-      if(data.source==='discard' && ps.discardPile.length>0){
-        card = ps.discardPile.shift();
+      if(data.source==='discard'&&ps.discardPile.length>0){
+        card=ps.discardPile.shift();
+        ps.hands[uid].push(card);
+        // Avisa quem comprou com a carta
+        socket.emit('game_action',{uid:'server',action:'pife_drew',data:{card}});
+        // Avisa adversário que comprou do descarte (sem revelar)
+        socket.to(roomId).emit('game_action',{uid,action:'pife_draw_discard',data:{}});
       } else {
-        if(ps.deck.length===0){ io.to(roomId).emit('game_action',{uid:'server',action:'pife_state',data:{msg:'Baralho esgotado!'}}); return; }
-        card = ps.deck.shift();
+        if(ps.deck.length===0) return;
+        card=ps.deck.shift();
+        ps.hands[uid].push(card);
+        socket.emit('game_action',{uid:'server',action:'pife_drew',data:{card}});
+        socket.to(roomId).emit('game_action',{uid,action:'pife_draw',data:{}});
       }
-      ps.hands[uid].push(card);
-      // Avisa quem comprou com a carta
-      socket.emit('game_action',{uid:'server',action:'pife_draw',data:{card}});
-      // Avisa adversário que comprou (sem revelar a carta)
-      socket.to(roomId).emit('game_action',{uid,action:'pife_draw',data:{card:null}});
       return;
     }
 
     // ── Pife: descartar ──
     if(action === 'pife_discard' && room?.pifeState) {
-      const ps = room.pifeState;
-      if(ps.currentTurn !== uid) return;
-      const hand = ps.hands[uid];
-      const card = hand.splice(data.idx, 1)[0];
-      if(!card) return;
+      const ps=room.pifeState;
+      if(ps.currentTurn!==uid) return;
+      const hand=ps.hands[uid];
+      const card=data.card||hand.splice(data.idx,1)[0];
+      // Remove da mão se ainda estiver lá
+      if(!data.card) {} else {
+        const idx=hand.findIndex(c=>c.rank===card.rank&&c.suit===card.suit);
+        if(idx>=0) hand.splice(idx,1);
+      }
       ps.discardPile.unshift(card);
       // Próximo turno
-      const idx = room.players.findIndex(p=>p.uid===uid);
-      ps.currentTurn = room.players[(idx+1)%room.players.length].uid;
+      const pidx=room.players.findIndex(p=>p.uid===uid);
+      ps.currentTurn=room.players[(pidx+1)%room.players.length].uid;
       io.to(roomId).emit('game_action',{uid,action:'pife_discard',data:{card,idx:data.idx}});
       return;
     }
 
-    // ── Pife: declarar ──
-    if(action === 'pife_declare' && room?.pifeState) {
-      // Valida se tem 3 grupos de 3
-      const hand = data.hand || [];
-      const winnerId = uid;
-      const loserId = room.players.find(p=>p.uid!==uid)?.uid;
+    // ── Pife: declarar pife ──
+    if(action === 'pife_declare') {
+      const winnerId=uid;
+      const loserId=room?.players.find(p=>p.uid!==uid)?.uid;
       io.to(roomId).emit('game_action',{uid:'server',action:'pife_win',data:{winnerId,loserId}});
       return;
     }
 
-    // Dados e outros jogos: repassa ação direto
+        // Dados e outros jogos: repassa ação direto
     socket.to(roomId).emit('game_action', { uid, action, data });
   });
 
