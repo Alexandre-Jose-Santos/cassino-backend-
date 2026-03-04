@@ -684,7 +684,7 @@ io.on('connection', socket => {
         for(let i=pieces.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pieces[i],pieces[j]]=[pieces[j],pieces[i]];}
         const hands={};
         for(const p of room.players) hands[p.uid]=pieces.splice(0,7);
-        room.dominoState={hands,board:[],boardEnds:{left:null,right:null},currentTurn:room.players[0].uid,passCount:0};
+        room.dominoState={hands,board:[],boardEnds:{left:null,right:null},stock:pieces,currentTurn:room.players[0].uid,passCount:0};
       }
       for(const p of room.players){
         const pSock=[...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
@@ -695,6 +695,7 @@ io.on('connection', socket => {
             board:room.dominoState.board,
             boardEnds:room.dominoState.boardEnds,
             oppCount:opp?.[1]?.length||7,
+            stockCount:room.dominoState.stock.length,
             myTurn:room.dominoState.currentTurn===p.uid,
           }});
         }
@@ -726,7 +727,7 @@ io.on('connection', socket => {
       // Próximo turno
       const pidx=room.players.findIndex(p=>p.uid===uid);
       ds.currentTurn=room.players[(pidx+1)%room.players.length].uid;
-      io.to(roomId).emit('game_action',{uid,action:'domino_played',data:{board:ds.board,boardEnds:ds.boardEnds,handIdx}});
+      io.to(roomId).emit('game_action',{uid,action:'domino_played',data:{board:ds.board,boardEnds:ds.boardEnds,handIdx,stockCount:ds.stock?.length||0}});
       // Verifica vitória (mão vazia)
       if(ds.hands[uid].length===0){
         const loserId=room.players.find(p=>p.uid!==uid)?.uid;
@@ -756,22 +757,76 @@ io.on('connection', socket => {
       return;
     }
 
-    if(action === 'domino_pass' && room?.dominoState) {
+    if(action === 'domino_draw' && room?.dominoState) {
+      const ds=room.dominoState;
+      if(ds.currentTurn!==uid) return;
+      if(!ds.stock||ds.stock.length===0){
+        socket.emit('game_action',{uid:'server',action:'domino_pass',data:{name:'Monte vazio'}});
+        return;
+      }
+      const piece=ds.stock.shift();
+      ds.hands[uid].push(piece);
+      // Avisa quem comprou com a peça
+      socket.emit('game_action',{uid:'server',action:'domino_drew',data:{piece,stockCount:ds.stock.length}});
+      // Avisa adversário
+      socket.to(roomId).emit('game_action',{uid,action:'domino_draw',data:{stockCount:ds.stock.length}});
+      // Se peça não encaixa, passa a vez automaticamente
+      const {left,right}=ds.boardEnds;
+      const fits=ds.board.length===0||piece.a===left||piece.b===left||piece.a===right||piece.b===right;
+      if(!fits){
+        ds.passCount=(ds.passCount||0)+1;
+        const pidx=room.players.findIndex(p=>p.uid===uid);
+        ds.currentTurn=room.players[(pidx+1)%room.players.length].uid;
+        const passer=room.players.find(p=>p.uid===uid);
+        io.to(roomId).emit('game_action',{uid,action:'domino_pass',data:{name:passer?.name,auto:true}});
+      } else {
+        ds.passCount=0; // peça encaixa, zera o contador
+      }
+      return;
+    }
+
+        if(action === 'domino_pass' && room?.dominoState) {
       const ds=room.dominoState;
       if(ds.currentTurn!==uid) return;
       ds.passCount=(ds.passCount||0)+1;
       const pidx=room.players.findIndex(p=>p.uid===uid);
       ds.currentTurn=room.players[(pidx+1)%room.players.length].uid;
-      io.to(roomId).emit('game_action',{uid,action:'domino_pass',data:{}});
-      // Dois passes seguidos = fechado, quem tem menos pontos ganha
+      // Notifica todos com nome de quem bateu
+      const passer=room.players.find(p=>p.uid===uid);
+      io.to(roomId).emit('game_action',{uid,action:'domino_pass',data:{name:passer?.name||'Jogador'}});
+      // Todos passaram = jogo fechado → menor pontuação vence
       if(ds.passCount>=room.players.length){
-        let winner=null,minPts=Infinity;
+        let winner=null,loser=null,minPts=Infinity;
         for(const p of room.players){
-          const pts=ds.hands[p.uid].reduce((s,pc)=>s+pc.a+pc.b,0);
+          const pts=(ds.hands[p.uid]||[]).reduce((acc,pc)=>acc+pc.a+pc.b,0);
           if(pts<minPts){minPts=pts;winner=p.uid;}
         }
-        const loser=room.players.find(p=>p.uid!==winner)?.uid;
-        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:winner,loserId:loser}});
+        loser=room.players.find(p=>p.uid!==winner)?.uid;
+        // Calcula pontos de cada um para exibição
+        const scores={};
+        for(const p of room.players) scores[p.uid]=(ds.hands[p.uid]||[]).reduce((acc,pc)=>acc+pc.a+pc.b,0);
+        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:winner,loserId:loser,scores,reason:'bateu'}});
+        // Debita/credita fichas
+        const bet=room.betAmount||0;
+        if(bet>0&&winner&&loser){
+          (async()=>{
+            try{
+              const lSnap=await db.collection('users').doc(loser).get();
+              const lChips=lSnap.exists?(lSnap.data().chips||0):0;
+              const debit=Math.min(bet,Math.max(0,lChips));
+              if(debit>0){
+                const batch=db.batch();
+                batch.update(db.collection('users').doc(loser),{chips:admin.firestore.FieldValue.increment(-debit)});
+                batch.update(db.collection('users').doc(winner),{chips:admin.firestore.FieldValue.increment(debit)});
+                await batch.commit();
+                await logTransaction(winner,'win',debit,'Dominó — bateu');
+                await logTransaction(loser,'loss',-debit,'Dominó — perdeu no bate');
+                const [wS,lS]=await Promise.all([db.collection('users').doc(winner).get(),db.collection('users').doc(loser).get()]);
+                io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              }
+            }catch(e){console.error('Erro bate dominó:',e);}
+          })();
+        }
       }
       return;
     }
