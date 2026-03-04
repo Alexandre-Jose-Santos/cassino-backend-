@@ -23,11 +23,24 @@ const db = admin.firestore();
 // ── Express + CORS ───────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
-  cors: { origin: process.env.FRONTEND_URL || '*', methods: ['GET','POST'] }
+const io = new Server(server, {
+  cors: { origin: process.env.FRONTEND_URL || '*', methods: ['GET','POST'], credentials: true },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling'],
 });
 
+// Keep-alive: evita que o Railway adormeça (free tier dorme após inatividade)
+setInterval(() => {
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (!domain) return;
+  require('https').get(`https://${domain}/health`, r => {
+    console.log(`💓 Keep-alive: ${r.statusCode} | salas: ${rooms.size} | conexões: ${io.sockets.sockets.size}`);
+  }).on('error', e => console.warn('Keep-alive falhou:', e.message));
+}, 4 * 60 * 1000); // a cada 4 minutos
+
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', rooms: rooms.size, connections: io.sockets.sockets.size, uptime: Math.floor(process.uptime()) }));
 app.use(express.json());
 
 // ── Mercado Pago Config ──────────────────────────────────────
@@ -839,7 +852,7 @@ io.on('connection', socket => {
   });
 
   // ── Rematch ──────────────────────────────────────────────
-  socket.on('rematch_vote', ({ roomId, accept }) => {
+  socket.on('rematch_vote', async ({ roomId, accept }) => {
     const room = rooms.get(roomId);
     if(!room) return;
 
