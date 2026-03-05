@@ -674,6 +674,7 @@ io.on('connection', socket => {
                 winnerChips:wSnap.data()?.chips||0,
                 loserChips:lSnap.data()?.chips||0,
               });
+              scheduleReset(room,roomId);
             }
           }catch(e){console.error('Erro ao processar pife:',e);}
         })();
@@ -757,6 +758,7 @@ io.on('connection', socket => {
                 await logTransaction(loserId,'loss',-debit,`Dominó — derrota`);
                 const [wS,lS]=await Promise.all([db.collection('users').doc(uid).get(),db.collection('users').doc(loserId).get()]);
                 io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro dominó:',e);}
           })();
@@ -831,6 +833,7 @@ io.on('connection', socket => {
                 await logTransaction(loser,'loss',-debit,'Dominó — perdeu no bate');
                 const [wS,lS]=await Promise.all([db.collection('users').doc(winner).get(),db.collection('users').doc(loser).get()]);
                 io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro bate dominó:',e);}
           })();
@@ -889,6 +892,8 @@ io.on('connection', socket => {
     } else {
       io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
     }
+
+    scheduleReset(room, roomId);
 
     if (room.matchId) {
       await db.collection('matches').doc(room.matchId).update({
