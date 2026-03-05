@@ -384,6 +384,23 @@ io.use(async (socket, next) => {
   }
 });
 
+// Reset automático da sala 10s após fim do jogo
+function scheduleReset(room, roomId) {
+  if(room.resetTimeout) clearTimeout(room.resetTimeout);
+  room.resetTimeout = setTimeout(()=>{
+    room.resetTimeout = null;
+    if(!rooms.has(roomId)) return;
+    room.status = 'waiting';
+    room.pifeState = null;
+    room.dominoState = null;
+    room.matchId = null;
+    room.players.forEach(p => { p.ready = false; });
+    io.to(roomId).emit('room_update', room);
+    io.to('lobby').emit('rooms_update', getRoomsList());
+    console.log('🔄 Sala ' + roomId + ' resetada');
+  }, 10500);
+}
+
 io.on('connection', socket => {
   const { uid, user } = socket.data;
   console.log(`✅ Conectado: ${user?.name} (${uid})`);
