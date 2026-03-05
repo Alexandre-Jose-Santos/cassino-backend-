@@ -938,17 +938,30 @@ io.on('connection', socket => {
     }
   });
 
-  function startRematch(room, roomId) {
+  async function startRematch(room, roomId) {
     if(room.rematchTimeout) { clearTimeout(room.rematchTimeout); room.rematchTimeout = null; }
-    room.status = 'waiting';
+    // Reseta estado
     room.rematchPlayers = null;
     room.pifeState = null;
     room.dominoState = null;
     room.matchId = null;
-    room.players.forEach(p => p.ready = false);
-    io.to(roomId).emit('rematch_start', {roomId});
-    io.to(roomId).emit('room_update', room);
+    room.players.forEach(p => p.ready = true); // todos prontos
+    room.status = 'playing';
+    // Cria novo match no Firestore
+    try {
+      const matchRef = await db.collection('matches').add({
+        roomId, game: room.game,
+        betAmount: room.betAmount,
+        players: room.players.map(p => p.uid),
+        status: 'playing',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      room.matchId = matchRef.id;
+    } catch(e) { console.error('Erro ao criar match rematch:', e); }
+    // Emite game_start diretamente — sem precisar de ready
+    io.to(roomId).emit('game_start', { room, matchId: room.matchId });
     io.to('lobby').emit('rooms_update', getRoomsList());
+    console.log(`🔄 Rematch: ${room.game} sala ${roomId}`);
   }
 
   // ── Desconexão ───────────────────────────────────────────
