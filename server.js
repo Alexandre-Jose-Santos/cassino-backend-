@@ -906,66 +906,49 @@ io.on('connection', socket => {
     });
   });
 
-  // ── Rematch ──────────────────────────────────────────────
-  socket.on('rematch_vote', async ({ roomId, accept }) => {
+  // ── Rematch simplificado ─────────────────────────────────
+  socket.on('rematch_join', ({ roomId }) => {
     const room = rooms.get(roomId);
     if(!room) return;
 
-    // Inicializa votos se necessário
-    if(!room.rematchVotes) room.rematchVotes = {};
-    room.rematchVotes[uid] = accept;
+    if(!room.rematchPlayers) room.rematchPlayers = new Set();
+    room.rematchPlayers.add(uid);
 
+    const player = room.players.find(p => p.uid === uid);
     const total = room.players.length;
-    const voter = room.players.find(p => p.uid === uid);
+    const count = room.rematchPlayers.size;
 
-    // Notifica todos da sala
-    io.to(roomId).emit('rematch_vote', {
-      uid, name: voter?.name || 'Jogador',
-      accept,
-      votes: room.rematchVotes,
-      total,
+    // Avisa todos que este jogador quer jogar de novo
+    io.to(roomId).emit('rematch_player', {
+      name: player?.name || 'Jogador',
+      count, total,
     });
 
-    const allVoted = Object.keys(room.rematchVotes).length === total;
-    const allAccepted = allVoted && Object.values(room.rematchVotes).every(Boolean);
-    const anyRejected = Object.values(room.rematchVotes).some(v => v === false);
+    // Se todos entraram, inicia imediatamente
+    if(count >= total) {
+      startRematch(room, roomId);
+      return;
+    }
 
-    if(allAccepted) {
-      // Verifica saldo de todos antes de reiniciar
-      if(room.betAmount > 0) {
-        let semSaldo = null;
-        for(const p of room.players) {
-          const snap = await db.collection('users').doc(p.uid).get();
-          const chips = snap.exists ? (snap.data().chips || 0) : 0;
-          if(chips < room.betAmount) { semSaldo = {name: p.name, chips, needed: room.betAmount}; break; }
-        }
-        if(semSaldo) {
-          io.to(roomId).emit('rematch_blocked', {
-            message: `❌ ${semSaldo.name} tem apenas ${semSaldo.chips} fichas e a aposta é ${semSaldo.needed}. Reduza a aposta ou saia.`,
-            playerName: semSaldo.name,
-            chips: semSaldo.chips,
-            needed: semSaldo.needed,
-          });
-          room.rematchVotes = {};
-          return;
-        }
-      }
-      // Reinicia sala
-      room.status = 'waiting';
-      room.rematchVotes = {};
-      room.pifeState = null;
-      room.matchId = null;
-      room.players.forEach(p => p.ready = false);
-      io.to(roomId).emit('rematch_ok', {});
-      io.to('lobby').emit('rooms_update', getRoomsList());
-    } else if(anyRejected) {
-      // Alguém recusou — remove sala após 3s
-      setTimeout(() => {
-        rooms.delete(roomId);
-        io.to('lobby').emit('rooms_update', getRoomsList());
-      }, 3000);
+    // Se é o primeiro a entrar, inicia timer de 10s
+    if(count === 1) {
+      room.rematchTimeout = setTimeout(() => {
+        startRematch(room, roomId);
+      }, 10000);
     }
   });
+
+  function startRematch(room, roomId) {
+    if(room.rematchTimeout) { clearTimeout(room.rematchTimeout); room.rematchTimeout = null; }
+    room.status = 'waiting';
+    room.rematchPlayers = null;
+    room.pifeState = null;
+    room.dominoState = null;
+    room.matchId = null;
+    room.players.forEach(p => p.ready = false);
+    io.to(roomId).emit('rematch_start', {});
+    io.to('lobby').emit('rooms_update', getRoomsList());
+  }
 
   // ── Desconexão ───────────────────────────────────────────
   socket.on('disconnect', () => {
