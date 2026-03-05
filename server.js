@@ -946,7 +946,8 @@ io.on('connection', socket => {
     room.dominoState = null;
     room.matchId = null;
     room.players.forEach(p => p.ready = false);
-    io.to(roomId).emit('rematch_start', {});
+    io.to(roomId).emit('rematch_start', {roomId});
+    io.to(roomId).emit('room_update', room);
     io.to('lobby').emit('rooms_update', getRoomsList());
   }
 
