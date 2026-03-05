@@ -438,6 +438,14 @@ io.on('connection', socket => {
 
     if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
 
+    // Verifica saldo antes de entrar
+    const joinSnap = await db.collection('users').doc(uid).get();
+    const joinBalance = joinSnap.exists ? (joinSnap.data().chips || 0) : 0;
+    if (joinBalance < room.betAmount) {
+      socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e a aposta é ${room.betAmount}.` });
+      return;
+    }
+
     room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
     socket.join(roomId);
     // Confirma entrada para quem entrou
@@ -910,61 +918,85 @@ io.on('connection', socket => {
   socket.on('rematch_join', ({ roomId }) => {
     const room = rooms.get(roomId);
     if(!room) return;
-
     if(!room.rematchPlayers) room.rematchPlayers = new Set();
     room.rematchPlayers.add(uid);
-
     const player = room.players.find(p => p.uid === uid);
     const total = room.players.length;
     const count = room.rematchPlayers.size;
-
-    // Avisa todos que este jogador quer jogar de novo
-    io.to(roomId).emit('rematch_player', {
-      name: player?.name || 'Jogador',
-      count, total,
-    });
-
-    // Se todos entraram, inicia imediatamente
-    if(count >= total) {
-      startRematch(room, roomId);
-      return;
-    }
-
-    // Se é o primeiro a entrar, inicia timer de 10s
+    io.to(roomId).emit('rematch_player', { name: player?.name || 'Jogador', count, total });
+    if(count >= total) { startRematch(room, roomId); return; }
     if(count === 1) {
-      room.rematchTimeout = setTimeout(() => {
-        startRematch(room, roomId);
-      }, 10000);
+      // Inicia countdown de 10s no backend
+      let remaining = 10;
+      room.rematchCountdown = setInterval(() => {
+        remaining--;
+        io.to(roomId).emit('rematch_countdown', { remaining });
+        if(remaining <= 0) {
+          clearInterval(room.rematchCountdown);
+          room.rematchCountdown = null;
+          startRematch(room, roomId);
+        }
+      }, 1000);
     }
+  });
+
+  socket.on('rematch_leave', ({ roomId }) => {
+    // Jogador clicou sair após partida
+    const room = rooms.get(roomId);
+    if(room) {
+      room.players = room.players.filter(p => p.uid !== uid);
+      if(room.players.length === 0) {
+        if(room.rematchCountdown) clearInterval(room.rematchCountdown);
+        if(room.rematchTimeout) clearTimeout(room.rematchTimeout);
+        rooms.delete(roomId);
+      } else {
+        io.to(roomId).emit('room_update', room);
+      }
+      io.to('lobby').emit('rooms_update', getRoomsList());
+    }
+    socket.leave(roomId);
+    socket.emit('room_left', {});
   });
 
   async function startRematch(room, roomId) {
     if(room.rematchTimeout) { clearTimeout(room.rematchTimeout); room.rematchTimeout = null; }
-    // Reseta estado
+    if(room.rematchCountdown) { clearInterval(room.rematchCountdown); room.rematchCountdown = null; }
     room.rematchPlayers = null;
     room.pifeState = null;
     room.dominoState = null;
     room.matchId = null;
-    room.players.forEach(p => p.ready = true); // todos prontos
     room.status = 'playing';
-    // Cria novo match no Firestore
+    room.players.forEach(p => p.ready = true);
     try {
       const matchRef = await db.collection('matches').add({
-        roomId, game: room.game,
-        betAmount: room.betAmount,
+        roomId, game: room.game, betAmount: room.betAmount,
         players: room.players.map(p => p.uid),
         status: 'playing',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       room.matchId = matchRef.id;
-    } catch(e) { console.error('Erro ao criar match rematch:', e); }
-    // Emite game_start diretamente — sem precisar de ready
+    } catch(e) { console.error('Erro match rematch:', e); }
     io.to(roomId).emit('game_start', { room, matchId: room.matchId });
     io.to('lobby').emit('rooms_update', getRoomsList());
     console.log(`🔄 Rematch: ${room.game} sala ${roomId}`);
   }
 
   // ── Desconexão ───────────────────────────────────────────
+  socket.on('reset_room', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if(!room) return;
+    // Reseta sala para estado de espera
+    room.status = 'waiting';
+    room.started = false;
+    room.pifeState = null;
+    room.dominoState = null;
+    room.matchId = null;
+    room.players.forEach(p => { p.ready = false; });
+    io.to(roomId).emit('room_update', room);
+    io.to('lobby').emit('rooms_update', getRoomsList());
+    console.log(`🔄 Sala ${roomId} resetada para nova partida`);
+  });
+
   socket.on('disconnect', () => {
     console.log(`❌ Desconectado: ${user?.name}`);
     // Marca jogador como offline mas NÃO remove a sala
