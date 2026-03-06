@@ -874,6 +874,67 @@ io.on('connection', socket => {
 
     // Outros jogos: repassa direto
     socket.to(roomId).emit('game_action', { uid, action, data });
+
+  // ── Dama Online ────────────────────────────────────
+    if (action === 'dama_init') {
+      // Atribui cores fixas: players[0]=brancas, players[1]=pretas
+      // Faz isso sempre para garantir consistência
+      room.players.forEach((p, i) => { p.damaColor = i === 0 ? 'w' : 'b'; });
+      // Envia para CADA jogador apenas a SUA cor
+      room.players.forEach(p => {
+        io.to(p.socketId).emit('game_action', {
+          action: 'dama_init', data: { color: p.damaColor }
+        });
+      });
+    }
+
+    if (action === 'dama_move') {
+      const myPlayer = room.players.find(p => p.uid === uid);
+      const myColor = myPlayer?.damaColor;
+      const nextTurn = data.nextTurn || (myColor === 'w' ? 'b' : 'w');
+      // Salva board no servidor
+      room.damaBoard = data.board;
+      // Broadcast para TODOS (inclusive quem jogou — confirma o estado)
+      io.to(roomId).emit('game_action', {
+        action: 'dama_update',
+        data: { board: data.board, turn: nextTurn }
+      });
+      // Verifica vitória: adversário sem peças
+      const oColor = myColor === 'w' ? 'b' : 'w';
+      const hasPieces = data.board.some(row => row.some(c => c && c.color === oColor));
+      if (!hasPieces) {
+        const opp = room.players.find(p => p.uid !== uid);
+        io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId: uid, loserId: opp?.uid } });
+        io.to(roomId).emit('game_result', { winnerId: uid, loserId: opp?.uid, prize: room.betAmount });
+        scheduleReset(room, roomId);
+      }
+    }
+
+  // ── Xadrez Online ──────────────────────────────────
+    if (action === 'xadrez_init') {
+      room.players.forEach((p, i) => { p.xadrezColor = i === 0 ? 'w' : 'b'; });
+      room.players.forEach(p => {
+        io.to(p.socketId).emit('game_action', {
+          action: 'xadrez_init', data: { color: p.xadrezColor }
+        });
+      });
+    }
+
+    if (action === 'xadrez_move') {
+      const nextTurn = uid === room.players[0].uid ? 'b' : 'w';
+      // Broadcast estado para todos
+      io.to(roomId).emit('game_action', {
+        action: 'xadrez_update',
+        data: { board: data.board, turn: nextTurn, enPassant: data.enPassant, castling: data.castling, lastMove: { from: data.from, to: data.to } }
+      });
+    }
+
+    if (action === 'xadrez_win') {
+      const loserId = room.players.find(p => p.uid !== data.winnerId)?.uid;
+      io.to(roomId).emit('game_action', { action: 'xadrez_win', data: { winnerId: data.winnerId, loserId, reason: data.reason } });
+      io.to(roomId).emit('game_result', { winnerId: data.winnerId, loserId, prize: room.betAmount });
+      scheduleReset(room, roomId);
+    }
   });
 
   // ── Fim de jogo ─────────────────────────────────────────
@@ -945,76 +1006,6 @@ io.on('connection', socket => {
   });
 
 
-  // ── Dama Online ───────────────────────────────────────────
-  socket.on('game_action', ({ roomId, action, data }) => {
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    if (action === 'dama_init') {
-      // Atribui cores fixas: players[0]=brancas, players[1]=pretas
-      // Faz isso sempre para garantir consistência
-      room.players.forEach((p, i) => { p.damaColor = i === 0 ? 'w' : 'b'; });
-      // Envia para CADA jogador apenas a SUA cor
-      room.players.forEach(p => {
-        io.to(p.socketId).emit('game_action', {
-          action: 'dama_init', data: { color: p.damaColor }
-        });
-      });
-    }
-
-    if (action === 'dama_move') {
-      const myPlayer = room.players.find(p => p.uid === uid);
-      const myColor = myPlayer?.damaColor;
-      const nextTurn = data.nextTurn || (myColor === 'w' ? 'b' : 'w');
-      // Salva board no servidor
-      room.damaBoard = data.board;
-      // Broadcast para TODOS (inclusive quem jogou — confirma o estado)
-      io.to(roomId).emit('game_action', {
-        action: 'dama_update',
-        data: { board: data.board, turn: nextTurn }
-      });
-      // Verifica vitória: adversário sem peças
-      const oColor = myColor === 'w' ? 'b' : 'w';
-      const hasPieces = data.board.some(row => row.some(c => c && c.color === oColor));
-      if (!hasPieces) {
-        const opp = room.players.find(p => p.uid !== uid);
-        io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId: uid, loserId: opp?.uid } });
-        io.to(roomId).emit('game_result', { winnerId: uid, loserId: opp?.uid, prize: room.betAmount });
-        scheduleReset(room, roomId);
-      }
-    }
-  });
-
-  // ── Xadrez Online ─────────────────────────────────────────
-  socket.on('game_action', ({ roomId, action, data }) => {
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    if (action === 'xadrez_init') {
-      room.players.forEach((p, i) => { p.xadrezColor = i === 0 ? 'w' : 'b'; });
-      room.players.forEach(p => {
-        io.to(p.socketId).emit('game_action', {
-          action: 'xadrez_init', data: { color: p.xadrezColor }
-        });
-      });
-    }
-
-    if (action === 'xadrez_move') {
-      const nextTurn = uid === room.players[0].uid ? 'b' : 'w';
-      // Broadcast estado para todos
-      io.to(roomId).emit('game_action', {
-        action: 'xadrez_update',
-        data: { board: data.board, turn: nextTurn, enPassant: data.enPassant, castling: data.castling, lastMove: { from: data.from, to: data.to } }
-      });
-    }
-
-    if (action === 'xadrez_win') {
-      const loserId = room.players.find(p => p.uid !== data.winnerId)?.uid;
-      io.to(roomId).emit('game_action', { action: 'xadrez_win', data: { winnerId: data.winnerId, loserId, reason: data.reason } });
-      io.to(roomId).emit('game_result', { winnerId: data.winnerId, loserId, prize: room.betAmount });
-      scheduleReset(room, roomId);
-    }
-  });
 
   // ── Chat da sala ─────────────────────────────────────────
   socket.on('chat_message', ({ roomId, message }) => {
