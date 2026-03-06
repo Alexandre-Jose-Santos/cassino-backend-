@@ -703,10 +703,8 @@ io.on('connection', socket => {
                 winnerChips:wSnap.data()?.chips||0,
                 loserChips:lSnap.data()?.chips||0,
               });
-              // Incrementa vitórias do vencedor
               const wpife = room.players.find(p=>p.uid===winnerId);
-              if(wpife) wpife.score = (wpife.score||0)+1;
-              scheduleReset(room,roomId);
+              if(wpife) wpife.score = (wpife.score||0)+1;;
             }
           }catch(e){console.error('Erro ao processar pife:',e);}
         })();
@@ -791,7 +789,6 @@ io.on('connection', socket => {
                 const [wS,lS]=await Promise.all([db.collection('users').doc(uid).get(),db.collection('users').doc(loserId).get()]);
                 io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
               const wdom = room.players.find(p=>p.uid===uid); if(wdom) wdom.score=(wdom.score||0)+1;
-              scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro dominó:',e);}
           })();
@@ -867,7 +864,6 @@ io.on('connection', socket => {
                 const [wS,lS]=await Promise.all([db.collection('users').doc(winner).get(),db.collection('users').doc(loser).get()]);
                 io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
               const wdom = room.players.find(p=>p.uid===winner); if(wdom) wdom.score=(wdom.score||0)+1;
-              scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro bate dominó:',e);}
           })();
@@ -932,8 +928,6 @@ io.on('connection', socket => {
       const wp = room.players.find(p=>p.uid===winnerId);
       if(wp) { wp.score = (wp.score||0)+1; }
     }
-    scheduleReset(room, roomId);
-
     if (room.matchId) {
       await db.collection('matches').doc(room.matchId).update({
         status: 'finished', winnerId, loserId,
@@ -1029,16 +1023,20 @@ io.on('connection', socket => {
   socket.on('reset_room', ({ roomId }) => {
     const room = rooms.get(roomId);
     if(!room) return;
-    // Reseta sala para estado de espera
     room.status = 'waiting';
-    room.started = false;
     room.pifeState = null;
     room.dominoState = null;
     room.matchId = null;
     room.players.forEach(p => { p.ready = false; });
     io.to(roomId).emit('room_update', room);
     io.to('lobby').emit('rooms_update', getRoomsList());
-    console.log(`🔄 Sala ${roomId} resetada para nova partida`);
+  });
+
+  socket.on('schedule_reset', ({ roomId }) => {
+    // Jogador clicou Reiniciar — agenda reset em 10s (sincronizado com contagem do frontend)
+    const room = rooms.get(roomId);
+    if(!room) return;
+    scheduleReset(room, roomId);
   });
 
   socket.on('disconnect', () => {
