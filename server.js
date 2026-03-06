@@ -880,14 +880,13 @@ io.on('connection', socket => {
 
   // ── Dama Online ────────────────────────────────────
     if (action === 'dama_init') {
-      // Atribui cores fixas: players[0]=brancas, players[1]=pretas
-      // Faz isso sempre para garantir consistência
+      // Atribui cores: players[0]=brancas, players[1]=pretas
       room.players.forEach((p, i) => { p.damaColor = i === 0 ? 'w' : 'b'; });
-      // Envia para CADA jogador apenas a SUA cor
-      room.players.forEach(p => {
-        io.to(p.socketId).emit('game_action', {
-          action: 'dama_init', data: { color: p.damaColor }
-        });
+      // Envia para a sala inteira — cada cliente filtra a sua cor pelo uid
+      const colorMap = {};
+      room.players.forEach(p => { colorMap[p.uid] = p.damaColor; });
+      io.to(roomId).emit('game_action', {
+        action: 'dama_init', data: { colorMap }
       });
     }
 
