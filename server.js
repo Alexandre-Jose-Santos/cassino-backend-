@@ -944,6 +944,76 @@ io.on('connection', socket => {
     socket.emit('rooms_update', getRoomsList());
   });
 
+
+  // ── Dama Online ───────────────────────────────────────────
+  socket.on('game_action', ({ roomId, action, data }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (action === 'dama_init') {
+      // Atribui cores — criador é brancas
+      room.players.forEach((p, i) => {
+        p.damaColor = i === 0 ? 'w' : 'b';
+      });
+      room.players.forEach(p => {
+        io.to(p.socketId).emit('game_action', {
+          action: 'dama_init', data: { color: p.damaColor }
+        });
+      });
+    }
+
+    if (action === 'dama_move') {
+      // Repassa o estado do tabuleiro para o adversário
+      const opp = room.players.find(p => p.uid !== uid);
+      if (opp) {
+        io.to(opp.socketId).emit('game_action', {
+          action: 'dama_update',
+          data: { board: data.board, turn: data.board ? (uid === room.players[0].uid ? 'b' : 'w') : 'w', from: data.from, to: data.to, caps: data.caps }
+        });
+      }
+      // Verifica vitória: adversário sem peças
+      const oColor = uid === room.players[0].uid ? 'b' : 'w';
+      const hasPieces = data.board.some(row => row.some(c => c && c.color === oColor));
+      if (!hasPieces) {
+        const loserId = opp?.uid;
+        io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId: uid, loserId } });
+        io.to(roomId).emit('game_result', { winnerId: uid, loserId, prize: room.betAmount });
+        scheduleReset(room, roomId);
+      }
+    }
+  });
+
+  // ── Xadrez Online ─────────────────────────────────────────
+  socket.on('game_action', ({ roomId, action, data }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (action === 'xadrez_init') {
+      room.players.forEach((p, i) => { p.xadrezColor = i === 0 ? 'w' : 'b'; });
+      room.players.forEach(p => {
+        io.to(p.socketId).emit('game_action', {
+          action: 'xadrez_init', data: { color: p.xadrezColor }
+        });
+      });
+    }
+
+    if (action === 'xadrez_move') {
+      const nextTurn = uid === room.players[0].uid ? 'b' : 'w';
+      // Broadcast estado para todos
+      io.to(roomId).emit('game_action', {
+        action: 'xadrez_update',
+        data: { board: data.board, turn: nextTurn, enPassant: data.enPassant, castling: data.castling, lastMove: { from: data.from, to: data.to } }
+      });
+    }
+
+    if (action === 'xadrez_win') {
+      const loserId = room.players.find(p => p.uid !== data.winnerId)?.uid;
+      io.to(roomId).emit('game_action', { action: 'xadrez_win', data: { winnerId: data.winnerId, loserId, reason: data.reason } });
+      io.to(roomId).emit('game_result', { winnerId: data.winnerId, loserId, prize: room.betAmount });
+      scheduleReset(room, roomId);
+    }
+  });
+
   // ── Chat da sala ─────────────────────────────────────────
   socket.on('chat_message', ({ roomId, message }) => {
     const clean = message.slice(0, 120);
