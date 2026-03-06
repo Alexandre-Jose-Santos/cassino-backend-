@@ -872,8 +872,11 @@ io.on('connection', socket => {
       return;
     }
 
-    // Outros jogos: repassa direto
-    socket.to(roomId).emit('game_action', { uid, action, data });
+    // Outros jogos: repassa direto (exceto dama e xadrez que têm handlers próprios)
+    if (!['dama_init','dama_move','xadrez_init','xadrez_move','xadrez_win'].includes(action)) {
+      socket.to(roomId).emit('game_action', { uid, action, data });
+      return;
+    }
 
   // ── Dama Online ────────────────────────────────────
     if (action === 'dama_init') {
