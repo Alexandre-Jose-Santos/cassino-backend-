@@ -1034,8 +1034,9 @@ io.on('connection', socket => {
 
   socket.on('schedule_reset', ({ roomId }) => {
     const room = rooms.get(roomId);
-    if(!room || room.resetTimeout) return; // já agendado
-    // Avisa TODOS para começar contagem de 10s
+    if(!room || room.resetTimeout) return;
+    // Só o criador (players[0]) pode reiniciar
+    if(room.players[0]?.uid !== uid) return;
     io.to(roomId).emit('rematch_countdown_start', {});
     scheduleReset(room, roomId);
   });
