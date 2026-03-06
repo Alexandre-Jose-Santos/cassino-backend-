@@ -951,15 +951,15 @@ io.on('connection', socket => {
     if (!room) return;
 
     if (action === 'dama_init') {
-      // Ambos jogadores emitem — atribuímos cor baseado na posição no array
+      // Atribui cores fixas: players[0]=brancas, players[1]=pretas
+      // Faz isso sempre para garantir consistência
       room.players.forEach((p, i) => { p.damaColor = i === 0 ? 'w' : 'b'; });
-      // Responde apenas para quem emitiu (cada um recebe sua própria cor)
-      const myPlayer = room.players.find(p => p.uid === uid);
-      if (myPlayer) {
-        io.to(myPlayer.socketId).emit('game_action', {
-          action: 'dama_init', data: { color: myPlayer.damaColor }
+      // Envia para CADA jogador apenas a SUA cor
+      room.players.forEach(p => {
+        io.to(p.socketId).emit('game_action', {
+          action: 'dama_init', data: { color: p.damaColor }
         });
-      }
+      });
     }
 
     if (action === 'dama_move') {
