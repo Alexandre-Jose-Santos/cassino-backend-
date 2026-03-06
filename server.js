@@ -951,10 +951,9 @@ io.on('connection', socket => {
     if (!room) return;
 
     if (action === 'dama_init') {
-      // Atribui cores — criador é brancas
-      room.players.forEach((p, i) => {
-        p.damaColor = i === 0 ? 'w' : 'b';
-      });
+      // Só o criador (players[0]) dispara — atribui cores
+      if (uid !== room.players[0].uid) return;
+      room.players.forEach((p, i) => { p.damaColor = i === 0 ? 'w' : 'b'; });
       room.players.forEach(p => {
         io.to(p.socketId).emit('game_action', {
           action: 'dama_init', data: { color: p.damaColor }
@@ -963,21 +962,23 @@ io.on('connection', socket => {
     }
 
     if (action === 'dama_move') {
-      // Repassa o estado do tabuleiro para o adversário
-      const opp = room.players.find(p => p.uid !== uid);
-      if (opp) {
-        io.to(opp.socketId).emit('game_action', {
-          action: 'dama_update',
-          data: { board: data.board, turn: data.board ? (uid === room.players[0].uid ? 'b' : 'w') : 'w', from: data.from, to: data.to, caps: data.caps }
-        });
-      }
+      const myPlayer = room.players.find(p => p.uid === uid);
+      const myColor = myPlayer?.damaColor;
+      const nextTurn = data.nextTurn || (myColor === 'w' ? 'b' : 'w');
+      // Salva board no servidor
+      room.damaBoard = data.board;
+      // Broadcast para TODOS (inclusive quem jogou — confirma o estado)
+      io.to(roomId).emit('game_action', {
+        action: 'dama_update',
+        data: { board: data.board, turn: nextTurn }
+      });
       // Verifica vitória: adversário sem peças
-      const oColor = uid === room.players[0].uid ? 'b' : 'w';
+      const oColor = myColor === 'w' ? 'b' : 'w';
       const hasPieces = data.board.some(row => row.some(c => c && c.color === oColor));
       if (!hasPieces) {
-        const loserId = opp?.uid;
-        io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId: uid, loserId } });
-        io.to(roomId).emit('game_result', { winnerId: uid, loserId, prize: room.betAmount });
+        const opp = room.players.find(p => p.uid !== uid);
+        io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId: uid, loserId: opp?.uid } });
+        io.to(roomId).emit('game_result', { winnerId: uid, loserId: opp?.uid, prize: room.betAmount });
         scheduleReset(room, roomId);
       }
     }
