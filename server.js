@@ -1033,9 +1033,10 @@ io.on('connection', socket => {
   });
 
   socket.on('schedule_reset', ({ roomId }) => {
-    // Jogador clicou Reiniciar — agenda reset em 10s (sincronizado com contagem do frontend)
     const room = rooms.get(roomId);
-    if(!room) return;
+    if(!room || room.resetTimeout) return; // já agendado
+    // Avisa TODOS para começar contagem de 10s
+    io.to(roomId).emit('rematch_countdown_start', {});
     scheduleReset(room, roomId);
   });
 
