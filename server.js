@@ -952,6 +952,14 @@ io.on('connection', socket => {
     });
   });
 
+  socket.on('chat_audio', ({ roomId, audio, mimeType }) => {
+    if (!audio || typeof audio !== 'string' || audio.length > 700000) return;
+    if (!audio.startsWith('data:audio/')) return;
+    io.to(roomId).emit('chat_audio', {
+      uid, name: user.name, audio, mimeType, time: Date.now()
+    });
+  });
+
   // ── Rematch simplificado ─────────────────────────────────
   socket.on('rematch_join', ({ roomId }) => {
     const room = rooms.get(roomId);
