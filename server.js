@@ -508,6 +508,18 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
+    // Verifica saldo de todos
+    if(room.betAmount > 0) {
+      for(const p of room.players) {
+        const snap = await db.collection('users').doc(p.uid).get();
+        const chips = snap.exists ? (snap.data().chips||0) : 0;
+        if(chips < room.betAmount) {
+          io.to(room.id||roomId).emit('error', { message: `${p.name} tem apenas ${chips} fichas. Aposta mínima: ${room.betAmount}.` });
+          // Reduz aposta automaticamente para o mínimo possível
+          return;
+        }
+      }
+    }
     room.status = 'playing';
     const matchRef = await db.collection('matches').add({
       roomId, game: room.game,
@@ -691,6 +703,9 @@ io.on('connection', socket => {
                 winnerChips:wSnap.data()?.chips||0,
                 loserChips:lSnap.data()?.chips||0,
               });
+              // Incrementa vitórias do vencedor
+              const wpife = room.players.find(p=>p.uid===winnerId);
+              if(wpife) wpife.score = (wpife.score||0)+1;
               scheduleReset(room,roomId);
             }
           }catch(e){console.error('Erro ao processar pife:',e);}
@@ -775,6 +790,7 @@ io.on('connection', socket => {
                 await logTransaction(loserId,'loss',-debit,`Dominó — derrota`);
                 const [wS,lS]=await Promise.all([db.collection('users').doc(uid).get(),db.collection('users').doc(loserId).get()]);
                 io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              const wdom = room.players.find(p=>p.uid===uid); if(wdom) wdom.score=(wdom.score||0)+1;
               scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro dominó:',e);}
@@ -850,6 +866,7 @@ io.on('connection', socket => {
                 await logTransaction(loser,'loss',-debit,'Dominó — perdeu no bate');
                 const [wS,lS]=await Promise.all([db.collection('users').doc(winner).get(),db.collection('users').doc(loser).get()]);
                 io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+              const wdom = room.players.find(p=>p.uid===winner); if(wdom) wdom.score=(wdom.score||0)+1;
               scheduleReset(room,roomId);
               }
             }catch(e){console.error('Erro bate dominó:',e);}
@@ -910,6 +927,11 @@ io.on('connection', socket => {
       io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
     }
 
+    // Incrementa vitórias do vencedor na sala
+    if(winnerId) {
+      const wp = room.players.find(p=>p.uid===winnerId);
+      if(wp) { wp.score = (wp.score||0)+1; }
+    }
     scheduleReset(room, roomId);
 
     if (room.matchId) {
