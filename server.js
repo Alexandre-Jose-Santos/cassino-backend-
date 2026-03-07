@@ -1049,6 +1049,28 @@ io.on('connection', socket => {
     }
   });
 
+  socket.on('leave_room', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (room) {
+      // Remove o jogador da sala
+      room.players = room.players.filter(p => p.uid !== uid);
+      if (room.players.length === 0) {
+        // Sala vazia — remove
+        if (room.rematchCountdown) clearInterval(room.rematchCountdown);
+        if (room.rematchTimeout) clearTimeout(room.rematchTimeout);
+        rooms.delete(roomId);
+        console.log(`🗑️ Sala ${roomId} removida (todos saíram)`);
+      } else {
+        // Avisa quem ficou
+        io.to(roomId).emit('room_update', room);
+        io.to(roomId).emit('player_offline', { uid, room });
+        console.log(`🚪 ${user?.name} saiu da sala ${roomId}`);
+      }
+      io.to('lobby').emit('rooms_update', getRoomsList());
+    }
+    socket.leave(roomId);
+  });
+
   socket.on('rematch_leave', ({ roomId }) => {
     // Jogador clicou sair após partida
     const room = rooms.get(roomId);
