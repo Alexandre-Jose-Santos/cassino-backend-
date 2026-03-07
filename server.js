@@ -570,13 +570,24 @@ io.on('connection', socket => {
     const room = rooms.get(roomId);
 
     // ── Pife Online: inicializa ──
+    if(action === 'pife_decks_chosen') {
+      if(!room) return;
+      // Criador escolheu baralhos — broadcast para o outro jogador
+      socket.to(roomId).emit('game_action', { uid, action: 'pife_decks_chosen', data });
+      return;
+    }
+
     if(action === 'pife_init') {
       if(!room) return;
       if(!room.pifeState) {
-        // Cria e embaralha baralho com ids únicos
+        // Cria e embaralha baralho com ids únicos (1 ou 2 baralhos)
+        const nDecks = data.numDecks===2 ? 2 : 1;
+        room.pifeNumDecks = nDecks;
         const suits=['♠','♥','♦','♣'], ranks=['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
         let deck=[];
-        for(const su of suits) for(const r of ranks) deck.push({rank:r,suit:su,id:`${r}${su}_${Math.random().toString(36).slice(2)}`});
+        for(let d=0;d<nDecks;d++)
+          for(const su of suits) for(const r of ranks)
+            deck.push({rank:r,suit:su,id:`${r}${su}_${d}_${Math.random().toString(36).slice(2)}`});
         for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
         const hands={};
         for(const p of room.players) hands[p.uid]=deck.splice(0,9);
