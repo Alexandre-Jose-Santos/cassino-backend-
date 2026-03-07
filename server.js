@@ -1052,19 +1052,23 @@ io.on('connection', socket => {
   socket.on('leave_room', ({ roomId }) => {
     const room = rooms.get(roomId);
     if (room) {
-      // Remove o jogador da sala
+      // Primeiro marca offline e avisa — para o outro jogador ver "📴 Offline"
+      const player = room.players.find(p => p.uid === uid);
+      if (player) {
+        player.online = false;
+        player.ready = false;
+        player.disconnectedAt = Date.now();
+        io.to(roomId).emit('room_update', room);
+        io.to(roomId).emit('player_offline', { uid, room });
+        console.log(`🚪 ${user?.name} saiu da sala ${roomId}`);
+      }
+      // Depois remove
       room.players = room.players.filter(p => p.uid !== uid);
       if (room.players.length === 0) {
-        // Sala vazia — remove
         if (room.rematchCountdown) clearInterval(room.rematchCountdown);
         if (room.rematchTimeout) clearTimeout(room.rematchTimeout);
         rooms.delete(roomId);
         console.log(`🗑️ Sala ${roomId} removida (todos saíram)`);
-      } else {
-        // Avisa quem ficou
-        io.to(roomId).emit('room_update', room);
-        io.to(roomId).emit('player_offline', { uid, room });
-        console.log(`🚪 ${user?.name} saiu da sala ${roomId}`);
       }
       io.to('lobby').emit('rooms_update', getRoomsList());
     }
@@ -1136,15 +1140,15 @@ io.on('connection', socket => {
 
   socket.on('disconnect', () => {
     console.log(`❌ Desconectado: ${user?.name}`);
-    // Marca jogador como offline mas NÃO remove a sala
-    // A sala só some depois de 5 minutos sem ninguém reconectar
     for (const [roomId, room] of rooms.entries()) {
       const player = room.players.find(p => p.uid === uid);
       if (player) {
         player.online = false;
+        player.ready = false;  // reset pronto ao desconectar
         player.disconnectedAt = Date.now();
         // Avisa outros na sala
         io.to(roomId).emit('player_offline', { uid, room });
+        io.to(roomId).emit('room_update', room); // força atualização visual
         // Agenda limpeza da sala após 5 minutos se ainda vazia/offline
         setTimeout(() => {
           const r = rooms.get(roomId);
