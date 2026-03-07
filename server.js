@@ -915,11 +915,9 @@ io.on('connection', socket => {
   // ── Xadrez Online ──────────────────────────────────
     if (action === 'xadrez_init') {
       room.players.forEach((p, i) => { p.xadrezColor = i === 0 ? 'w' : 'b'; });
-      room.players.forEach(p => {
-        io.to(p.socketId).emit('game_action', {
-          action: 'xadrez_init', data: { color: p.xadrezColor }
-        });
-      });
+      const colorMap = {};
+      room.players.forEach(p => { colorMap[p.uid] = p.xadrezColor; });
+      io.to(roomId).emit('game_action', { action: 'xadrez_init', data: { colorMap } });
     }
 
     if (action === 'xadrez_move') {
