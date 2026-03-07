@@ -573,10 +573,10 @@ io.on('connection', socket => {
     if(action === 'pife_init') {
       if(!room) return;
       if(!room.pifeState) {
-        // Cria e embaralha baralho
+        // Cria e embaralha baralho com ids únicos
         const suits=['♠','♥','♦','♣'], ranks=['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
         let deck=[];
-        for(const su of suits) for(const r of ranks) deck.push({rank:r,suit:su});
+        for(const su of suits) for(const r of ranks) deck.push({rank:r,suit:su,id:`${r}${su}_${Math.random().toString(36).slice(2)}`});
         for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
         const hands={};
         for(const p of room.players) hands[p.uid]=deck.splice(0,9);
@@ -645,6 +645,14 @@ io.on('connection', socket => {
     if(action === 'pife_declare') {
       const hand = data.hand || [];
       if(hand.length !== 9){ socket.emit('game_action',{uid:'server',action:'pife_invalid',data:{}}); return; }
+      // Valida que as cartas declaradas estão na mão real do jogador
+      const realHand = room.pifeState?.hands[uid] || [];
+      const declaredIds = hand.map(c=>c.id).filter(Boolean);
+      const realIds = realHand.map(c=>c.id).filter(Boolean);
+      if(declaredIds.length===9 && realIds.length>0){
+        const valid = declaredIds.every(id=>realIds.includes(id)) && new Set(declaredIds).size===9;
+        if(!valid){ socket.emit('game_action',{uid:'server',action:'pife_invalid',data:{}}); return; }
+      }
       // Valida grupos
       const vals={'A':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13};
       const isGroup=(g)=>{
