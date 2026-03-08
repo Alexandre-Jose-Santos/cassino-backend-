@@ -859,6 +859,191 @@ io.on('connection', socket => {
     }
 
 
+
+    // ══════════════════════════════════════════════════════════════
+    // GO ONLINE HANDLERS
+    // ══════════════════════════════════════════════════════════════
+
+    if(action === 'go_rules_chosen') {
+      if(!room) return;
+      room.goRules = data.rules || {countMethod:'territory',komi:6.5};
+      socket.to(roomId).emit('game_action',{uid:'server',action:'go_rules_chosen',data:{rules:room.goRules}});
+      return;
+    }
+
+    if(action === 'go_init') {
+      if(!room) return;
+      const rules = data.rules || room.goRules || {countMethod:'territory',komi:6.5};
+      room.goRules = rules;
+      if(!room.goState) {
+        // Assign colors: first player = Black, second = White
+        const colors = {};
+        colors[room.players[0].uid] = 'B';
+        colors[room.players[1].uid] = 'W';
+        room.goState = {
+          board: Array.from({length:19},()=>new Array(19).fill(null)),
+          prevBoard: null,
+          turn: 'B',
+          passCount: 0,
+          caps: {B:0,W:0},
+          colors,
+          phase: 'play',
+          confirmations: {},
+        };
+        io.to(roomId).emit('game_action',{uid:'server',action:'go_start',data:{
+          colors,
+          countMethod: rules.countMethod,
+          komi: rules.komi,
+        }});
+      }
+      return;
+    }
+
+    if(action === 'go_move' && room?.goState) {
+      const gs = room.goState;
+      const {r, c, color} = data;
+      if(gs.turn !== color) return;
+      if(gs.colors[uid] !== color) return;
+      // Validate and place
+      if(gs.board[r][c]) return;
+      const newBoard = gs.board.map(row=>row.slice());
+      newBoard[r][c] = color;
+      // Capture
+      const opp = color==='B'?'W':'B';
+      let captured = 0;
+      const nb = (r2,c2) => [[r2-1,c2],[r2+1,c2],[r2,c2-1],[r2,c2+1]].filter(([a,b])=>a>=0&&a<19&&b>=0&&b<19);
+      const group = (b,r2,c2) => {
+        const col=b[r2][c2]; if(!col) return{stones:[],libs:[]};
+        const vis=new Set(); const stones=[]; const libs=new Set();
+        const q=[[r2,c2]];
+        while(q.length){const[cr,cc]=q.pop();const k=cr+','+cc;if(vis.has(k))continue;vis.add(k);stones.push([cr,cc]);
+          nb(cr,cc).forEach(([nr,nc])=>{const nk=nr+','+nc;if(!vis.has(nk)){if(!b[nr][nc])libs.add(nk);else if(b[nr][nc]===col)q.push([nr,nc]);}});}
+        return{stones,libs:Array.from(libs)};
+      };
+      nb(r,c).forEach(([nr,nc])=>{
+        if(newBoard[nr][nc]===opp){
+          const g=group(newBoard,nr,nc);
+          if(g.libs.length===0){captured+=g.stones.length;g.stones.forEach(([sr,sc])=>newBoard[sr][sc]=null);}
+        }
+      });
+      // Check suicide
+      const myG=group(newBoard,r,c);
+      if(myG.libs.length===0&&captured===0) return; // illegal
+      // Ko check
+      if(gs.prevBoard){
+        let same=true;
+        outer:for(let i=0;i<19;i++)for(let j=0;j<19;j++)if(newBoard[i][j]!==gs.prevBoard[i][j]){same=false;break outer;}
+        if(same) return;
+      }
+      gs.prevBoard = gs.board.map(r=>r.slice());
+      gs.board = newBoard;
+      gs.caps[opp] = (gs.caps[opp]||0) + captured;
+      gs.turn = opp;
+      gs.passCount = 0;
+      io.to(roomId).emit('game_action',{uid,action:'go_move',data:{r,c,color,captured}});
+      return;
+    }
+
+    if(action === 'go_pass' && room?.goState) {
+      const gs = room.goState;
+      const color = gs.colors[uid];
+      if(gs.turn !== color) return;
+      gs.passCount = (gs.passCount||0) + 1;
+      gs.turn = color==='B'?'W':'B';
+      io.to(roomId).emit('game_action',{uid,action:'go_pass',data:{color}});
+      if(gs.passCount >= 2) {
+        gs.phase = 'scoring';
+        io.to(roomId).emit('game_action',{uid:'server',action:'go_scoring',data:{}});
+      }
+      return;
+    }
+
+    if(action === 'go_resign' && room?.goState) {
+      const gs = room.goState;
+      const winnerId = room.players.find(p=>p.uid!==uid)?.uid;
+      const loserId = uid;
+      io.to(roomId).emit('game_action',{uid:'server',action:'go_win',data:{winnerId,loserId,resigned:true,black:0,white:0,diff:0}});
+      const bet = room.betAmount||0;
+      if(bet>0&&winnerId){
+        (async()=>{
+          try{
+            const lSnap=await db.collection('users').doc(loserId).get();
+            const lChips=lSnap.exists?(lSnap.data().chips||0):0;
+            const debit=Math.min(bet,Math.max(0,lChips));
+            if(debit>0){
+              const batch=db.batch();
+              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
+              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
+              await batch.commit();
+            }
+            const [wS,lS]=await Promise.all([db.collection('users').doc(winnerId).get(),db.collection('users').doc(loserId).get()]);
+            io.to(roomId).emit('game_result',{winnerId,loserId,prize:bet,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+          }catch(e){console.error('Go resign error:',e);}
+        })();
+      }
+      room.goState = null;
+      return;
+    }
+
+    if(action === 'go_confirm_score' && room?.goState) {
+      const gs = room.goState;
+      gs.confirmations = gs.confirmations||{};
+      gs.confirmations[uid] = data.deadStones||[];
+      // Wait for both players to confirm
+      if(Object.keys(gs.confirmations).length < 2) return;
+      // Merge dead stones (union of both players' selections)
+      const deadSet = new Set([...gs.confirmations[room.players[0].uid],...gs.confirmations[room.players[1].uid]]);
+      const finalBoard = gs.board.map(r=>r.slice());
+      deadSet.forEach(k=>{const[r,c]=k.split(',').map(Number);if(finalBoard[r]&&finalBoard[r][c])finalBoard[r][c]=null;});
+      const rules = room.goRules||{countMethod:'territory',komi:6.5};
+      // Score
+      function scoreBoard(board,N,komi,method){
+        let bS=0,wS=komi;
+        const vis=Array.from({length:N},()=>new Array(N).fill(false));
+        for(let i=0;i<N;i++)for(let j=0;j<N;j++){
+          if(board[i][j]==='B')bS+=(method==='area'?1:0);
+          else if(board[i][j]==='W')wS+=(method==='area'?1:0);
+          else if(!vis[i][j]){
+            const region=[],borders=new Set(),q=[[i,j]];
+            while(q.length){const[cr,cc]=q.pop();if(vis[cr][cc])continue;vis[cr][cc]=true;region.push([cr,cc]);
+              [[cr-1,cc],[cr+1,cc],[cr,cc-1],[cr,cc+1]].filter(([a,b])=>a>=0&&a<N&&b>=0&&b<N).forEach(([nr,nc])=>{
+                if(board[nr][nc])borders.add(board[nr][nc]);else if(!vis[nr][nc])q.push([nr,nc]);});}
+            if(borders.size===1){if(borders.has('B'))bS+=region.length;else wS+=region.length;}
+          }
+        }
+        return{black:Math.round(bS*10)/10,white:Math.round(wS*10)/10};
+      }
+      const sc = scoreBoard(finalBoard,19,rules.komi,rules.countMethod);
+      const blackWins = sc.black > sc.white;
+      const blackUid = Object.entries(gs.colors).find(([k,v])=>v==='B')?.[0];
+      const whiteUid = Object.entries(gs.colors).find(([k,v])=>v==='W')?.[0];
+      const winnerId = blackWins ? blackUid : whiteUid;
+      const loserId = blackWins ? whiteUid : blackUid;
+      const diff = Math.abs(sc.black - sc.white);
+      io.to(roomId).emit('game_action',{uid:'server',action:'go_win',data:{winnerId,loserId,black:sc.black,white:sc.white,diff,resigned:false}});
+      const bet = room.betAmount||0;
+      if(bet>0){
+        (async()=>{
+          try{
+            const lSnap=await db.collection('users').doc(loserId).get();
+            const lChips=lSnap.exists?(lSnap.data().chips||0):0;
+            const debit=Math.min(bet,Math.max(0,lChips));
+            if(debit>0){
+              const batch=db.batch();
+              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
+              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
+              await batch.commit();
+              const [wS,lS]=await Promise.all([db.collection('users').doc(winnerId).get(),db.collection('users').doc(loserId).get()]);
+              io.to(roomId).emit('game_result',{winnerId,loserId,prize:bet,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
+            }
+          }catch(e){console.error('Go score error:',e);}
+        })();
+      }
+      room.goState = null;
+      return;
+    }
+
+
     if(action === 'pife_decks_chosen') {
       if(!room) return;
       // Criador escolheu baralhos — broadcast para o outro jogador
