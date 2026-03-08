@@ -401,6 +401,139 @@ function scheduleReset(room, roomId) {
   }, 10500);
 }
 
+
+function advancePokerStage(room, roomId, io) {
+  const ps = room.pokerState;
+  if(!ps) return;
+  const BB = room.betAmount || 10;
+  // Reset bets for new street
+  ps.bets = {};
+  ps.curBet = 0;
+  // Dealer (players[0]) acts first post-flop
+  ps.currentTurn = room.players[0].uid;
+
+  let newComm = [...ps.community];
+  let stage = ps.stage;
+
+  if(stage === 'pre') {
+    newComm = [ps.deck.pop(), ps.deck.pop(), ps.deck.pop()];
+    ps.stage = 'flop';
+  } else if(stage === 'flop') {
+    newComm = [...ps.community, ps.deck.pop()];
+    ps.stage = 'turn';
+  } else if(stage === 'turn') {
+    newComm = [...ps.community, ps.deck.pop()];
+    ps.stage = 'river';
+  } else {
+    // Showdown
+    doPokerShowdown(room, roomId, io);
+    return;
+  }
+  ps.community = newComm;
+
+  for(const p of room.players) {
+    const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+    if(pSock) {
+      const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
+      pSock.emit('game_action',{uid:'server',action:'poker_community',data:{
+        community: newComm,
+        stage: ps.stage,
+        myTurn: ps.currentTurn === p.uid,
+        chips: ps.chips[p.uid]||0,
+        oppChips: ps.chips[oppUid]||0,
+        pot: ps.pot,
+      }});
+    }
+  }
+}
+
+function doPokerShowdown(room, roomId, io) {
+  const ps = room.pokerState;
+  if(!ps) return;
+  const p0 = room.players[0].uid;
+  const p1 = room.players[1].uid;
+
+  // Evaluate hands
+  function pkEvalServer(cards) {
+    if(!cards||cards.length<5) return [0,0,0,0,0,0];
+    const RV={'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14};
+    function combos5(arr) {
+      const res=[];
+      function go(s,cur){if(cur.length===5){res.push(cur.slice());return;}for(let i=s;i<arr.length;i++){cur.push(arr[i]);go(i+1,cur);cur.pop();}}
+      go(0,[]);return res;
+    }
+    function score(h) {
+      const vals=h.map(c=>RV[c.rank]).sort((a,b)=>b-a);
+      const suits=h.map(c=>c.suit);
+      const fl=suits.every(s=>s===suits[0]);
+      const uv=[...new Set(vals)].sort((a,b)=>b-a);
+      let st=0;
+      if(uv.length===5&&uv[0]-uv[4]===4) st=uv[0];
+      else if(uv.length===5&&uv[0]===14&&uv[1]===5) st=5;
+      const cnt={};vals.forEach(v=>{cnt[v]=(cnt[v]||0)+1;});
+      const g=Object.keys(cnt).map(v=>({v:+v,c:cnt[v]})).sort((a,b)=>b.c-a.c||b.v-a.v);
+      if(fl&&st) return st===14?[9,...vals]:[8,st,...vals];
+      if(g[0].c===4) return [7,g[0].v,g[1]?.v||0,...vals];
+      if(g[0].c===3&&g[1]?.c===2) return [6,g[0].v,g[1].v,...vals];
+      if(fl) return [5,...vals];
+      if(st) return [4,st,...vals];
+      if(g[0].c===3) return [3,g[0].v,...vals];
+      if(g[0].c===2&&g[1]?.c===2) return [2,Math.max(g[0].v,g[1].v),Math.min(g[0].v,g[1].v),g[2]?.v||0,...vals];
+      if(g[0].c===2) return [1,g[0].v,...vals];
+      return [0,...vals];
+    }
+    const names=['Carta Alta','Par','Dois Pares','Trinca','Sequencia','Flush','Full House','Quadra','Straight Flush','Royal Flush'];
+    let best=null,bestScore=null;
+    for(const h of combos5(cards)){
+      const s=score(h);
+      if(!bestScore){best=h;bestScore=s;continue;}
+      for(let i=0;i<s.length;i++){if(s[i]>bestScore[i]){best=h;bestScore=s;break;}if(s[i]<bestScore[i])break;}
+    }
+    return {score:bestScore||[0,...Array(5).fill(0)],name:names[bestScore?bestScore[0]:0]||''};
+  }
+
+  const h0 = pkEvalServer([...ps.hands[p0], ...ps.community]);
+  const h1 = pkEvalServer([...ps.hands[p1], ...ps.community]);
+  let cmp = 0;
+  for(let i=0;i<h0.score.length;i++){cmp=h0.score[i]-h1.score[i];if(cmp!==0)break;}
+
+  let winnerId, loserId, tie=false;
+  const bet = room.betAmount||10;
+  if(cmp>0){winnerId=p0;loserId=p1;}
+  else if(cmp<0){winnerId=p1;loserId=p0;}
+  else{tie=true;winnerId=p0;loserId=p1;}
+
+  if(!tie){
+    ps.chips[winnerId] = (ps.chips[winnerId]||0) + ps.pot;
+  } else {
+    const half = Math.floor(ps.pot/2);
+    ps.chips[p0] += half;
+    ps.chips[p1] += ps.pot - half;
+  }
+
+  // Emit to both players
+  for(const p of room.players) {
+    const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+    const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
+    if(pSock) pSock.emit('game_action',{uid:'server',action:'poker_win',data:{
+      winnerId: tie?null:winnerId,
+      tie,
+      myChips: ps.chips[p.uid]||0,
+      oppChips: ps.chips[oppUid]||0,
+      oppHand: ps.hands[oppUid],
+      myHand: {score:p.uid===p0?h0.score:h1.score},
+      reason: tie?'Empate!':(p.uid===winnerId?`${p.uid===p0?h0.name:h1.name} bate ${p.uid===p0?h1.name:h0.name}`:
+        `${p.uid===p0?h1.name:h0.name} bate ${p.uid===p0?h0.name:h1.name}`)
+    }});
+  }
+
+  io.to(roomId).emit('game_result',{
+    winnerId: tie?null:winnerId, loserId: tie?null:loserId,
+    prize: bet, winnerChips: tie?null:ps.chips[winnerId], loserChips: tie?null:ps.chips[loserId]
+  });
+  room.pokerState = null;
+}
+
 io.on('connection', socket => {
   const { uid, user } = socket.data;
   console.log(`✅ Conectado: ${user?.name} (${uid})`);
@@ -570,6 +703,162 @@ io.on('connection', socket => {
     const room = rooms.get(roomId);
 
     // ── Pife Online: inicializa ──
+
+    // ══════════════════════════════════════════
+    // POKER ONLINE HANDLERS
+    // ══════════════════════════════════════════
+
+    if(action === 'poker_init') {
+      if(!room) return;
+      const BB = room.betAmount || 10;
+      const SB = Math.max(5, Math.floor(BB/2));
+      const suits=['spade','heart','diam','club'];
+      const ranks=['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+      let deck=[];
+      for(const s of suits) for(const r of ranks)
+        deck.push({rank:r,suit:s,id:`${r}${s}_${Math.random().toString(36).slice(2)}`});
+      for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
+
+      const startChips = BB * 10;
+      const hands = {};
+      const chips = {};
+      room.players.forEach(p => {
+        hands[p.uid] = [deck.pop(), deck.pop()];
+        chips[p.uid] = startChips;
+      });
+
+      // players[0] = dealer (paga SB), players[1] = big blind (paga BB)
+      const dealerUid = room.players[0].uid;
+      const bbUid = room.players[1].uid;
+      chips[dealerUid] -= SB;
+      chips[bbUid] -= BB;
+      const pot = SB + BB;
+      const bets = {};
+      bets[dealerUid] = SB;
+      bets[bbUid] = BB;
+
+      room.pokerState = {
+        deck, hands, chips, bets, pot,
+        community: [],
+        stage: 'pre',
+        curBet: BB,
+        currentTurn: dealerUid, // dealer acts first pre-flop
+        foldedUid: null,
+      };
+
+      // Debit chips from Firestore when game starts
+      // (handled by game_result at end)
+
+      // Send to each player
+      for(const p of room.players) {
+        const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+        if(pSock) {
+          const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
+          pSock.emit('game_action',{uid:'server',action:'poker_deal',data:{
+            hand: room.pokerState.hands[p.uid],
+            chips: room.pokerState.chips[p.uid],
+            oppChips: room.pokerState.chips[oppUid]||0,
+            pot, myBet: bets[p.uid]||0, oppBet: bets[oppUid]||0,
+            curBet: BB,
+            myTurn: room.pokerState.currentTurn === p.uid,
+          }});
+        }
+      }
+      return;
+    }
+
+    if(action === 'poker_action' && room?.pokerState) {
+      const ps = room.pokerState;
+      const BB = room.betAmount || 10;
+      const SB = Math.max(5, Math.floor(BB/2));
+      const oppUid = room.players.find(p=>p.uid!==uid)?.uid;
+      if(ps.currentTurn !== uid) return;
+
+      const playerAction = data.action;
+
+      if(playerAction === 'fold') {
+        ps.foldedUid = uid;
+        const winnerId = oppUid;
+        const winnerChips = (ps.chips[winnerId]||0) + ps.pot;
+        ps.chips[winnerId] = winnerChips;
+        // Emit result
+        io.to(roomId).emit('game_action',{uid:'server',action:'poker_fold',data:{
+          winnerId,
+          myChips: ps.chips[uid]||0,
+          oppChips: winnerChips,
+          pot: 0,
+        }});
+        // Chip transaction
+        const bet = room.betAmount||10;
+        io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:bet,
+          winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]});
+        room.pokerState = null;
+        return;
+      }
+
+      const myBet = ps.bets[uid]||0;
+      const oppBet = ps.bets[oppUid]||0;
+      let nextTurn = oppUid;
+
+      if(playerAction === 'check') {
+        // Both checked — advance stage
+        const bothChecked = myBet >= ps.curBet && oppBet >= ps.curBet;
+        if(bothChecked || ps.curBet === 0) {
+          advancePokerStage(room, roomId, io);
+          return;
+        }
+      } else if(playerAction === 'call') {
+        const toCall = Math.min(ps.curBet - myBet, ps.chips[uid]);
+        ps.chips[uid] -= toCall;
+        ps.bets[uid] = (ps.bets[uid]||0) + toCall;
+        ps.pot += toCall;
+        // After call, advance stage
+        io.to(roomId).emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'call', uid,
+          pot: ps.pot, oppChips: ps.chips[uid],
+          oppBet: ps.bets[uid], curBet: ps.curBet,
+          myTurn: false,
+        }});
+        // Send to caller too
+        const callerSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===uid);
+        if(callerSock) callerSock.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'called', uid, pot:ps.pot, myTurn:false,
+        }});
+        setTimeout(()=>advancePokerStage(room, roomId, io), 600);
+        return;
+      } else if(playerAction === 'raise') {
+        const amount = data.amount || ps.curBet*2;
+        const toAdd = Math.min(amount - myBet, ps.chips[uid]);
+        ps.chips[uid] -= toAdd;
+        ps.bets[uid] = (ps.bets[uid]||0) + toAdd;
+        ps.pot += toAdd;
+        ps.curBet = ps.bets[uid];
+        // Emit to opponent
+        const oppSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===oppUid);
+        if(oppSock) oppSock.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'raise', uid,
+          pot: ps.pot, oppChips: ps.chips[uid],
+          oppBet: ps.bets[uid], curBet: ps.curBet,
+          myTurn: true, raiseAmt: ps.curBet,
+        }});
+        const raiseSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===uid);
+        if(raiseSock) raiseSock.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'raised', uid, pot:ps.pot, myTurn:false,
+        }});
+        ps.currentTurn = oppUid;
+        return;
+      }
+
+      // Check — just pass turn
+      ps.currentTurn = nextTurn;
+      const oppSock2 = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===oppUid);
+      if(oppSock2) oppSock2.emit('game_action',{uid:'server',action:'poker_action',data:{
+        action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
+      }});
+      return;
+    }
+
+
     if(action === 'pife_decks_chosen') {
       if(!room) return;
       // Criador escolheu baralhos — broadcast para o outro jogador
