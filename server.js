@@ -1021,6 +1021,14 @@ io.on('connection', socket => {
     }
 
         // ── Dominó Online ─────────────────────────────────────────
+    if(action === 'domino_rules_chosen') {
+      if(!room) return;
+      // Criador escolheu regras — salva e broadcast pro adversário
+      room.dominoRules = data.rules || {duasPontas:1,bateDe4:1};
+      socket.to(roomId).emit('game_action',{uid:'server',action:'domino_rules_chosen',data:{rules:room.dominoRules}});
+      return;
+    }
+
     if(action === 'domino_init') {
       if(!room) return;
       if(!room.dominoState) {
@@ -1031,7 +1039,8 @@ io.on('connection', socket => {
         for(let i=pieces.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pieces[i],pieces[j]]=[pieces[j],pieces[i]];}
         const hands={};
         for(const p of room.players) hands[p.uid]=pieces.splice(0,7);
-        room.dominoState={hands,board:[],boardEnds:{left:null,right:null},stock:pieces,currentTurn:room.players[0].uid,passCount:0};
+        const dominoRules=data.rules||room.dominoRules||{duasPontas:1,bateDe4:1};
+        room.dominoState={hands,board:[],boardEnds:{left:null,right:null},stock:pieces,currentTurn:room.players[0].uid,passCount:0,rules:dominoRules};
       }
       for(const p of room.players){
         const pSock=[...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
@@ -1078,7 +1087,18 @@ io.on('connection', socket => {
       // Verifica vitória (mão vazia)
       if(ds.hands[uid].length===0){
         const loserId=room.players.find(p=>p.uid!==uid)?.uid;
-        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:uid,loserId}});
+        // Detecta nojada
+        const r=ds.rules||{duasPontas:1,bateDe4:1};
+        const l=ds.boardEnds.left, rv=ds.boardEnds.right;
+        let nojada=null;
+        if(l!==null&&l===rv){
+          if(piece.a===piece.b&&piece.a===l&&r.bateDe4>0)
+            nojada={type:'bateDe4',label:'🔥 BATE DE 4!',mult:r.bateDe4||1};
+          else if(((piece.a===l&&piece.b===l)||(piece.b===l&&piece.a===l))&&r.duasPontas>0&&!nojada)
+            nojada={type:'duasPontas',label:'⚡ BATEU NAS 2 PONTAS!',mult:r.duasPontas||1};
+        }
+        const mult=nojada?nojada.mult:1;
+        io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:uid,loserId,nojada,mult}});
         // Debita/credita
         const bet=room.betAmount||0;
         if(bet>0&&loserId){
@@ -1086,7 +1106,7 @@ io.on('connection', socket => {
             try{
               const lSnap=await db.collection('users').doc(loserId).get();
               const lChips=lSnap.exists?(lSnap.data().chips||0):0;
-              const debit=Math.min(bet,Math.max(0,lChips));
+              const debit=Math.min(bet*mult,Math.max(0,lChips));
               if(debit>0){
                 const batch=db.batch();
                 batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
