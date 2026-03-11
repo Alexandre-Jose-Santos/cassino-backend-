@@ -1536,6 +1536,33 @@ io.on('connection', socket => {
     });
   });
 
+
+  // ── WebRTC Sinalização (chamada de voz) ──────────────────
+  socket.on('webrtc_call_request', ({ roomId, offer, uid: callerUid }) => {
+    // Encaminha offer para o outro jogador da sala
+    socket.to(roomId).emit('webrtc_call_request', { offer, uid: callerUid });
+  });
+
+  socket.on('webrtc_call_accept', ({ roomId, answer, uid: acceptUid }) => {
+    socket.to(roomId).emit('webrtc_call_accept', { answer, uid: acceptUid });
+  });
+
+  socket.on('webrtc_call_reject', ({ roomId, uid: rejectUid }) => {
+    socket.to(roomId).emit('webrtc_call_reject', { uid: rejectUid });
+  });
+
+  socket.on('webrtc_call_end', ({ roomId }) => {
+    socket.to(roomId).emit('webrtc_call_end', { uid });
+  });
+
+  socket.on('webrtc_ice', ({ roomId, candidate }) => {
+    socket.to(roomId).emit('webrtc_ice', { candidate, uid });
+  });
+
+  socket.on('webrtc_speaking', ({ roomId, speaking }) => {
+    socket.to(roomId).emit('webrtc_speaking', { uid, speaking });
+  });
+
   // ── Rematch simplificado ─────────────────────────────────
   socket.on('rematch_join', ({ roomId }) => {
     const room = rooms.get(roomId);
