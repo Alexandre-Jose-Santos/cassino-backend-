@@ -603,7 +603,7 @@ io.on('connection', socket => {
       io.to(roomId).emit('room_update', room);
       io.to(roomId).emit('player_online', { uid, name: jaEstaNaSala.name });
       io.to('lobby').emit('rooms_update', getRoomsList());
-      console.log(\`🔄 \${jaEstaNaSala.name} reconectou à sala \${roomId}\`);
+      console.log(`🔄 ${jaEstaNaSala.name} reconectou à sala ${roomId}`);
       return;
     }
 
