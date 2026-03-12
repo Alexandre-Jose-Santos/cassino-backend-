@@ -571,20 +571,42 @@ io.on('connection', socket => {
   socket.on('join_room', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room) { socket.emit('error', { message: 'Sala não encontrada' }); return; }
-    if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
 
-    // Verifica se jogador já está na sala (evita duplicata)
+    // ── Reconexão: jogador já estava na sala (durante partida ou na espera) ──
     const jaEstaNaSala = room.players.find(p => p.uid === uid);
     if (jaEstaNaSala) {
-      // Reconectou — marca como online novamente
       jaEstaNaSala.online = true;
       jaEstaNaSala.disconnectedAt = null;
+      jaEstaNaSala.socketId = socket.id;
       socket.join(roomId);
+      // Envia estado completo da sala + estado do jogo atual
       socket.emit('room_joined', { room });
+      socket.emit('room_update', room);
+      // Reenvía estado do jogo em andamento se houver
+      if (room.status === 'playing') {
+        // Dama: reenvia board atual
+        if (room.game === 'dama' && room.damaBoard) {
+          socket.emit('game_action', {
+            action: 'dama_update',
+            data: { board: room.damaBoard, turn: room.damaTurn || 'w' }
+          });
+          // Reenvia as cores
+          const colorMap = {};
+          room.players.forEach(p => { if(p.damaColor) colorMap[p.uid] = p.damaColor; });
+          socket.emit('game_action', { action: 'dama_init', data: { colorMap } });
+        }
+        // Dominó, Xadrez, etc: reenvia room_update que inclui game state
+        socket.emit('game_action', { action: 'reconnected', data: { game: room.game } });
+      }
       io.to(roomId).emit('room_update', room);
+      io.to(roomId).emit('player_online', { uid, name: jaEstaNaSala.name });
       io.to('lobby').emit('rooms_update', getRoomsList());
+      console.log(\`🔄 \${jaEstaNaSala.name} reconectou à sala \${roomId}\`);
       return;
     }
+
+    // Bloqueia entrada de NOVO jogador se jogo já iniciado
+    if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
 
     if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
 
@@ -1407,14 +1429,12 @@ io.on('connection', socket => {
       const myPlayer = room.players.find(p => p.uid === uid);
       const myColor = myPlayer?.damaColor;
       const nextTurn = data.nextTurn || (myColor === 'w' ? 'b' : 'w');
-      // Salva board no servidor
       room.damaBoard = data.board;
-      // Broadcast para TODOS (inclusive quem jogou — confirma o estado)
+      room.damaTurn = nextTurn;
       io.to(roomId).emit('game_action', {
         action: 'dama_update',
         data: { board: data.board, turn: nextTurn }
       });
-      // Verifica vitória: adversário sem peças
       const oColor = myColor === 'w' ? 'b' : 'w';
       const hasPieces = data.board.some(row => row.some(c => c && c.color === oColor));
       if (!hasPieces) {
@@ -1423,6 +1443,47 @@ io.on('connection', socket => {
         io.to(roomId).emit('game_result', { winnerId: uid, loserId: opp?.uid, prize: room.betAmount });
         scheduleReset(room, roomId);
       }
+    }
+
+    // Passar a vez (bloqueio/trancado)
+    if (action === 'dama_pass') {
+      if(!room) return;
+      room.damaBoard = data.board;
+      const nextTurn = data.nextTurn;
+      io.to(roomId).emit('game_action', {
+        action: 'dama_pass',
+        data: { board: data.board, turn: nextTurn }
+      });
+    }
+
+    // Declarar derrota voluntária (bloqueio)
+    if (action === 'dama_forfeit') {
+      if(!room) return;
+      const winnerId = room.players.find(p => p.uid !== uid)?.uid;
+      const loserId = uid;
+      io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId, loserId } });
+      const bet = room.betAmount || 0;
+      if (bet > 0 && winnerId) {
+        (async () => {
+          try {
+            const lSnap = await db.collection('users').doc(loserId).get();
+            const lChips = lSnap.exists ? (lSnap.data().chips || 0) : 0;
+            const debit = Math.min(bet, Math.max(0, lChips));
+            if (debit > 0) {
+              const batch = db.batch();
+              batch.update(db.collection('users').doc(loserId), { chips: admin.firestore.FieldValue.increment(-debit) });
+              batch.update(db.collection('users').doc(winnerId), { chips: admin.firestore.FieldValue.increment(debit) });
+              await batch.commit();
+            }
+            const [wS, lS] = await Promise.all([
+              db.collection('users').doc(winnerId).get(),
+              db.collection('users').doc(loserId).get()
+            ]);
+            io.to(roomId).emit('game_result', { winnerId, loserId, prize: bet, winnerChips: wS.data()?.chips || 0, loserChips: lS.data()?.chips || 0 });
+          } catch(e) { console.error('dama_forfeit error:', e); }
+        })();
+      }
+      scheduleReset(room, roomId);
     }
 
   // ── Xadrez Online ──────────────────────────────────
