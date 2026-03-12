@@ -48,11 +48,13 @@ app.use(express.json());
 const MP_TOKEN = process.env.MP_ACCESS_TOKEN; // sandbox token por agora
 
 // ── Pacotes de Fichas ─────────────────────────────────────────
+// 1 ficha = R$0,10 (10 fichas = R$1,00)
+const CHIP_RATE = 0.10;
 const PACKAGES = [
-  { id: 'pkg_5',   label: 'Starter',  price: 5,   chips: 500,   bonus: 0    },
-  { id: 'pkg_10',  label: 'Popular',  price: 10,  chips: 1000,  bonus: 100  },
-  { id: 'pkg_25',  label: 'Pro',      price: 25,  chips: 2700,  bonus: 300  },
-  { id: 'pkg_50',  label: 'VIP',      price: 50,  chips: 6000,  bonus: 1000 },
+  { id: 'pkg_5',   label: 'Starter',  price: 5,   chips: 50,    bonus: 0    },
+  { id: 'pkg_10',  label: 'Popular',  price: 10,  chips: 100,   bonus: 10   },
+  { id: 'pkg_25',  label: 'Pro',      price: 25,  chips: 270,   bonus: 30   },
+  { id: 'pkg_50',  label: 'VIP',      price: 50,  chips: 600,   bonus: 100  },
 ];
 
 const SAQUE_TAXA = 0.10; // 10% de taxa sobre saques
@@ -189,7 +191,7 @@ app.post('/api/payment/webhook', async (req, res) => {
     });
 
     await payRef.update({ status: 'approved', approvedAt: admin.firestore.FieldValue.serverTimestamp() });
-    await logTransaction(pay.userId, 'deposit', pay.chips, `Compra via PIX — R$${pay.price}`);
+    await logTransaction(pay.userId, 'deposit', pay.chips, `Compra via PIX — R$${pay.price} (${pay.chips} fichas)`);
 
     // Notifica cliente em tempo real via Socket.io
     const userSockets = [...io.sockets.sockets.values()]
@@ -219,7 +221,7 @@ app.post('/api/withdrawal/request', authMiddleware, async (req, res) => {
   }
 
   const { chips, pixKey } = req.body;
-  if (!chips || chips < 100) return res.status(400).json({ error: 'Mínimo de 100 fichas para saque' });
+  if (!chips || chips < 100) return res.status(400).json({ error: 'Mínimo de 100 fichas (R$10,00) para saque' });
   if (!pixKey) return res.status(400).json({ error: 'Chave PIX obrigatória' });
 
   const { uid } = req.user;
@@ -229,7 +231,7 @@ app.post('/api/withdrawal/request', authMiddleware, async (req, res) => {
 
   if (user.chips < chips) return res.status(400).json({ error: 'Saldo insuficiente' });
 
-  const grossValue = chips / 100;           // 1 ficha = R$0,01? defina a taxa aqui
+  const grossValue = parseFloat((chips * 0.10).toFixed(2)); // 1 ficha = R$0,10
   const fee        = grossValue * SAQUE_TAXA;
   const netValue   = parseFloat((grossValue - fee).toFixed(2));
 
@@ -1443,6 +1445,29 @@ io.on('connection', socket => {
         io.to(roomId).emit('game_result', { winnerId: uid, loserId: opp?.uid, prize: room.betAmount });
         scheduleReset(room, roomId);
       }
+    }
+
+    // Proposta de empate
+    if (action === 'dama_draw_offer') {
+      if(!room) return;
+      socket.to(roomId).emit('game_action', { action: 'dama_draw_offer', data: { fromUid: uid } });
+      return;
+    }
+
+    if (action === 'dama_draw_accept') {
+      if(!room) return;
+      // Empate — devolve fichas para ambos (sem transferência)
+      io.to(roomId).emit('game_action', { action: 'dama_win', data: { draw: true, winnerId: null, loserId: null } });
+      // Devolve aposta a ambos (ninguém perde fichas)
+      io.to(roomId).emit('game_result', { draw: true, winnerId: null, loserId: null, prize: 0 });
+      scheduleReset(room, roomId);
+      return;
+    }
+
+    if (action === 'dama_draw_decline') {
+      if(!room) return;
+      socket.to(roomId).emit('game_action', { action: 'dama_draw_declined', data: {} });
+      return;
     }
 
     // Passar a vez (bloqueio/trancado)
