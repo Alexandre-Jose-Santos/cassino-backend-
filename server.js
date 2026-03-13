@@ -51,10 +51,13 @@ const MP_TOKEN = process.env.MP_ACCESS_TOKEN; // sandbox token por agora
 // 1 ficha = R$0,10 (10 fichas = R$1,00)
 const CHIP_RATE = 0.10;
 const PACKAGES = [
-  { id: 'pkg_5',   label: 'Starter',  price: 5,   chips: 50,    bonus: 0    },
-  { id: 'pkg_10',  label: 'Popular',  price: 10,  chips: 100,   bonus: 10   },
-  { id: 'pkg_25',  label: 'Pro',      price: 25,  chips: 270,   bonus: 30   },
-  { id: 'pkg_50',  label: 'VIP',      price: 50,  chips: 600,   bonus: 100  },
+  { id: 'pkg_1',  label: 'Iniciante', price: 1.00,  chips: 10,   bonus: 0   },
+  { id: 'pkg_2',  label: 'Bronze',    price: 2.00,  chips: 20,   bonus: 0   },
+  { id: 'pkg_3',  label: 'Prata',     price: 5.00,  chips: 50,   bonus: 0   },
+  { id: 'pkg_4',  label: 'Ouro',      price: 10.00, chips: 100,  bonus: 0   },
+  { id: 'pkg_5',  label: 'Platina',   price: 20.00, chips: 200,  bonus: 10  },
+  { id: 'pkg_6',  label: 'Diamante',  price: 50.00, chips: 500,  bonus: 30  },
+  { id: 'pkg_7',  label: 'Elite',     price: 100.00,chips: 1000, bonus: 100 },
 ];
 
 const SAQUE_TAXA = 0.10; // 10% de taxa sobre saques
@@ -995,10 +998,7 @@ io.on('connection', socket => {
             const lChips=lSnap.exists?(lSnap.data().chips||0):0;
             const debit=Math.min(bet,Math.max(0,lChips));
             if(debit>0){
-              const batch=db.batch();
-              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
-              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
-              await batch.commit();
+              // Sem transferência de fichas — jogo gratuito
             }
             const [wS,lS]=await Promise.all([db.collection('users').doc(winnerId).get(),db.collection('users').doc(loserId).get()]);
             io.to(roomId).emit('game_result',{winnerId,loserId,prize:bet,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
@@ -1053,10 +1053,7 @@ io.on('connection', socket => {
             const lChips=lSnap.exists?(lSnap.data().chips||0):0;
             const debit=Math.min(bet,Math.max(0,lChips));
             if(debit>0){
-              const batch=db.batch();
-              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
-              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
-              await batch.commit();
+              // Sem transferência de fichas — jogo gratuito
               const [wS,lS]=await Promise.all([db.collection('users').doc(winnerId).get(),db.collection('users').doc(loserId).get()]);
               io.to(roomId).emit('game_result',{winnerId,loserId,prize:bet,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
             }
@@ -1204,10 +1201,7 @@ io.on('connection', socket => {
             const loserChips=loserSnap.exists?(loserSnap.data().chips||0):0;
             const debit=Math.min(bet,Math.max(0,loserChips));
             if(debit>0){
-              const batch=db.batch();
-              batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
-              batch.update(db.collection('users').doc(winnerId),{chips:admin.firestore.FieldValue.increment(debit)});
-              await batch.commit();
+              // Sem transferência de fichas — jogo gratuito
               await logTransaction(winnerId,'win',debit,`Pife — ganhou de ${room.players.find(p=>p.uid===loserId)?.name}`);
               await logTransaction(loserId,'loss',-debit,`Pife — perdeu para ${room.players.find(p=>p.uid===winnerId)?.name}`);
               // Notifica saldos atualizados
