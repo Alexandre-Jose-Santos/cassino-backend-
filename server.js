@@ -466,6 +466,7 @@ function startPokerHand(room, roomId, io) {
     foldedUid: null,
     lastAction: null,
     checksThisStreet: 0,
+    checkedUids: new Set(),
   };
 
   for(const p of room.players) {
@@ -491,6 +492,7 @@ function advancePokerStage(room, roomId, io) {
   ps.curBet = 0;
   ps.lastAction = null;
   ps.checksThisStreet = 0;
+  ps.checkedUids = new Set();
   // Pós-flop: BB (players[1]) age primeiro
   const bbIdx = 1 - (room.pokerDealerIdx||0);
   ps.currentTurn = room.players[bbIdx].uid;
@@ -897,9 +899,12 @@ io.on('connection', socket => {
       }
 
       if(playerAction === 'check') {
-        ps.checksThisStreet = (ps.checksThisStreet||0) + 1;
+        // Só permite check se não há aposta a pagar
+        if(ps.curBet > (ps.bets[uid]||0)) return; // deve fazer call, não check
+        if(!ps.checkedUids) ps.checkedUids = new Set();
+        ps.checkedUids.add(uid);
         // Ambos checkaram — avança street
-        if(ps.checksThisStreet >= 2) {
+        if(ps.checkedUids.size >= 2) {
           advancePokerStage(room, roomId, io);
           return;
         }
@@ -924,6 +929,7 @@ io.on('connection', socket => {
         ps.chips[uid] = (ps.chips[uid]||0) - toCall;
         ps.bets[uid] = myBetNow + toCall;
         ps.pot += toCall;
+        ps.checkedUids = new Set();
         // Emite para ambos
         const mySockK = findSock(uid);
         if(mySockK) mySockK.emit('game_action',{uid:'server',action:'poker_action',data:{
@@ -948,6 +954,7 @@ io.on('connection', socket => {
         ps.pot += toAdd;
         ps.curBet = ps.bets[uid];
         ps.lastAction = 'raise';
+        ps.checkedUids = new Set(); // raise cancela checks anteriores
         ps.currentTurn = oppUid;
         const mySockR = findSock(uid);
         if(mySockR) mySockR.emit('game_action',{uid:'server',action:'poker_action',data:{
