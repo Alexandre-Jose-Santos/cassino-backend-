@@ -595,15 +595,16 @@ function doPokerShowdown(room, roomId, io) {
     }});
   }
 
+  const prize = ps.pot;
   io.to(roomId).emit('game_result',{
     winnerId: tie?null:winnerId, loserId: tie?null:loserId,
-    prize: bet, winnerChips: tie?null:ps.chips[winnerId], loserChips: tie?null:ps.chips[loserId]
+    prize, winnerChips: tie?null:ps.chips[winnerId], loserChips: tie?null:ps.chips[loserId]
   });
-  // Debita/credita o pot no Firestore após cada mão
-  if(!tie && winnerId && loserId) {
-    const potVal = ps.pot;
-    db.collection('users').doc(loserId).update({chips: admin.firestore.FieldValue.increment(-Math.floor(potVal/2))}).catch(()=>{});
-    db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(Math.floor(potVal/2))}).catch(()=>{});
+  // Debita valor apostado do perdedor e credita no vencedor no Firestore
+  if(!tie && winnerId && loserId && prize > 0) {
+    const half = Math.floor(prize / 2);
+    db.collection('users').doc(loserId).update({chips: admin.firestore.FieldValue.increment(-half)}).catch(()=>{});
+    db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(half)}).catch(()=>{});
   }
   room.pokerState = null;
 }
@@ -869,13 +870,13 @@ io.on('connection', socket => {
           oppChips: ps.chips[winnerId],
           pot: 0,
         }});
-        io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:room.betAmount||10,
+        const foldPrize = ps.pot;
+        io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:foldPrize,
           winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]||0});
-        // Debita/credita metade do pot no Firestore
-        const potVal = ps.pot;
-        if(potVal > 0) {
-          db.collection('users').doc(uid).update({chips: admin.firestore.FieldValue.increment(-Math.floor(potVal/2))}).catch(()=>{});
-          db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(Math.floor(potVal/2))}).catch(()=>{});
+        if(foldPrize > 0) {
+          const half = Math.floor(foldPrize / 2);
+          db.collection('users').doc(uid).update({chips: admin.firestore.FieldValue.increment(-half)}).catch(()=>{});
+          db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(half)}).catch(()=>{});
         }
         room.pokerState = null;
         return;
