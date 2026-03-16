@@ -448,9 +448,10 @@ function startPokerHand(room, roomId, io) {
     community: [],
     stage: 'pre',
     curBet: BB,
-    currentTurn: dealerUid, // dealer (SB) age primeiro no pre-flop
+    currentTurn: dealerUid,
     foldedUid: null,
     lastAction: null,
+    checksThisStreet: 0,
   };
 
   for(const p of room.players) {
@@ -475,6 +476,7 @@ function advancePokerStage(room, roomId, io) {
   ps.bets = {};
   ps.curBet = 0;
   ps.lastAction = null;
+  ps.checksThisStreet = 0;
   // Pós-flop: BB (players[1]) age primeiro
   const bbIdx = 1 - (room.pokerDealerIdx||0);
   ps.currentTurn = room.players[bbIdx].uid;
@@ -597,6 +599,12 @@ function doPokerShowdown(room, roomId, io) {
     winnerId: tie?null:winnerId, loserId: tie?null:loserId,
     prize: bet, winnerChips: tie?null:ps.chips[winnerId], loserChips: tie?null:ps.chips[loserId]
   });
+  // Debita/credita o pot no Firestore após cada mão
+  if(!tie && winnerId && loserId) {
+    const potVal = ps.pot;
+    db.collection('users').doc(loserId).update({chips: admin.firestore.FieldValue.increment(-Math.floor(potVal/2))}).catch(()=>{});
+    db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(Math.floor(potVal/2))}).catch(()=>{});
+  }
   room.pokerState = null;
 }
 
@@ -863,29 +871,35 @@ io.on('connection', socket => {
         }});
         io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:room.betAmount||10,
           winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]||0});
+        // Debita/credita metade do pot no Firestore
+        const potVal = ps.pot;
+        if(potVal > 0) {
+          db.collection('users').doc(uid).update({chips: admin.firestore.FieldValue.increment(-Math.floor(potVal/2))}).catch(()=>{});
+          db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(Math.floor(potVal/2))}).catch(()=>{});
+        }
         room.pokerState = null;
         return;
       }
 
       if(playerAction === 'check') {
-        // Se o adversário já checou (curBet=0 e oppBet=0), avança
-        const bothChecked = ps.curBet === 0;
-        if(bothChecked && ps.lastAction === 'check') {
+        ps.checksThisStreet = (ps.checksThisStreet||0) + 1;
+        // Ambos checkaram — avança street
+        if(ps.checksThisStreet >= 2) {
           advancePokerStage(room, roomId, io);
           return;
         }
-        ps.lastAction = 'check';
+        // Passa a vez pro adversário
         ps.currentTurn = oppUid;
         const oppSockC = findSock(oppUid);
         if(oppSockC) oppSockC.emit('game_action',{uid:'server',action:'poker_action',data:{
           action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
-          myChips: ps.chips[oppUid], myBet: ps.bets[oppUid]||0,
-          oppChips: ps.chips[uid], oppBet: ps.bets[uid]||0,
+          myChips: ps.chips[oppUid]||0, myBet: ps.bets[oppUid]||0,
+          oppChips: ps.chips[uid]||0, oppBet: ps.bets[uid]||0,
         }});
         const mySockC = findSock(uid);
         if(mySockC) mySockC.emit('game_action',{uid:'server',action:'poker_action',data:{
           action:'checked', uid, pot:ps.pot, myTurn:false, curBet:0,
-          myChips: ps.chips[uid], myBet: ps.bets[uid]||0,
+          myChips: ps.chips[uid]||0, myBet: ps.bets[uid]||0,
         }});
         return;
       }
