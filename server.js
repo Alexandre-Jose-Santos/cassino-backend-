@@ -37,10 +37,24 @@ setInterval(() => {
   require('https').get(`https://${domain}/health`, r => {
     console.log(`💓 Keep-alive: ${r.statusCode} | salas: ${rooms.size} | conexões: ${io.sockets.sockets.size}`);
   }).on('error', e => console.warn('Keep-alive falhou:', e.message));
-}, 4 * 60 * 1000); // a cada 4 minutos
+}, 3 * 60 * 1000); // a cada 3 minutos
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.get('/health', (req, res) => res.json({ status: 'ok', rooms: rooms.size, connections: io.sockets.sockets.size, uptime: Math.floor(process.uptime()) }));
+// /wake: acorda o servidor e limpa salas antigas (chamado pelo frontend)
+app.get('/wake', (req, res) => {
+  // Limpa salas que ficaram em estado inconsistente há mais de 30 min
+  const now = Date.now();
+  let cleaned = 0;
+  rooms.forEach((room, id) => {
+    if(room.status === 'waiting' && (now - (room.createdAt||now)) > 30*60*1000) {
+      rooms.delete(id);
+      cleaned++;
+    }
+  });
+  console.log(`⚡ Wake chamado — ${cleaned} salas limpas`);
+  res.json({ status: 'awake', rooms: rooms.size, cleaned });
+});
 app.use(express.json());
 
 // ── Mercado Pago Config ──────────────────────────────────────
