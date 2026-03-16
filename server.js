@@ -407,15 +407,77 @@ function scheduleReset(room, roomId) {
 }
 
 
+function startPokerHand(room, roomId, io) {
+  if(!room || room.players.length < 2) return;
+  const BB = room.betAmount || 10;
+  const SB = Math.max(5, Math.floor(BB/2));
+  const suits=['spade','heart','diam','club'];
+  const ranks=['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+  let deck=[];
+  for(const s of suits) for(const r of ranks)
+    deck.push({rank:r,suit:s,id:`${r}${s}_${Math.random().toString(36).slice(2)}`});
+  for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
+
+  // Alterna dealer: na primeira mão players[0] é dealer, nas seguintes alterna
+  if(!room.pokerDealerIdx) room.pokerDealerIdx = 0;
+  else room.pokerDealerIdx = 1 - room.pokerDealerIdx;
+  const dealerIdx = room.pokerDealerIdx;
+  const bbIdx = 1 - dealerIdx;
+  const dealerUid = room.players[dealerIdx].uid;
+  const bbUid = room.players[bbIdx].uid;
+
+  // Fichas: 20x o BB ou mantém das mãos anteriores
+  const prevChips = room.pokerState?.chips;
+  const startChips = BB * 20;
+  const chips = {};
+  room.players.forEach(p => {
+    chips[p.uid] = (prevChips && prevChips[p.uid] > 0) ? prevChips[p.uid] : startChips;
+  });
+
+  chips[dealerUid] -= SB;
+  chips[bbUid] -= BB;
+  const pot = SB + BB;
+  const bets = {};
+  bets[dealerUid] = SB;
+  bets[bbUid] = BB;
+  const hands = {};
+  room.players.forEach(p => { hands[p.uid] = [deck.pop(), deck.pop()]; });
+
+  room.pokerState = {
+    deck, hands, chips, bets, pot,
+    community: [],
+    stage: 'pre',
+    curBet: BB,
+    currentTurn: dealerUid, // dealer (SB) age primeiro no pre-flop
+    foldedUid: null,
+    lastAction: null,
+  };
+
+  for(const p of room.players) {
+    const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+    if(pSock) {
+      const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
+      pSock.emit('game_action',{uid:'server',action:'poker_deal',data:{
+        hand: hands[p.uid],
+        chips: chips[p.uid],
+        oppChips: chips[oppUid]||0,
+        pot, myBet: bets[p.uid]||0, oppBet: bets[oppUid]||0,
+        curBet: BB,
+        myTurn: room.pokerState.currentTurn === p.uid,
+      }});
+    }
+  }
+}
+
 function advancePokerStage(room, roomId, io) {
   const ps = room.pokerState;
   if(!ps) return;
-  const BB = room.betAmount || 10;
-  // Reset bets for new street
   ps.bets = {};
   ps.curBet = 0;
-  // Dealer (players[0]) acts first post-flop
-  ps.currentTurn = room.players[0].uid;
+  ps.lastAction = null;
+  // Pós-flop: BB (players[1]) age primeiro
+  const bbIdx = 1 - (room.pokerDealerIdx||0);
+  ps.currentTurn = room.players[bbIdx].uid;
 
   let newComm = [...ps.community];
   let stage = ps.stage;
@@ -430,7 +492,6 @@ function advancePokerStage(room, roomId, io) {
     newComm = [...ps.community, ps.deck.pop()];
     ps.stage = 'river';
   } else {
-    // Showdown
     doPokerShowdown(room, roomId, io);
     return;
   }
@@ -652,7 +713,7 @@ io.on('connection', socket => {
     io.to(roomId).emit('room_update', room);
   });
 
-  // ── Iniciar jogo (criador, todos prontos) — SEM debitar fichas ──
+  // ── Iniciar jogo (criador, todos prontos) ──
   socket.on('start_game', async ({ roomId }) => {
     const room = rooms.get(roomId);
     if (!room || room.status !== 'waiting') return;
@@ -668,19 +729,26 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
-    // Verifica saldo de todos
-    if(room.betAmount > 0) {
+    // Poker: entrada de 5 fichas por jogador (aposta mínima decidida dentro do jogo)
+    const entryCost = room.game === 'poker' ? 5 : (room.betAmount || 0);
+    if(entryCost > 0) {
       for(const p of room.players) {
         const snap = await db.collection('users').doc(p.uid).get();
         const chips = snap.exists ? (snap.data().chips||0) : 0;
-        if(chips < room.betAmount) {
-          io.to(room.id||roomId).emit('error', { message: `${p.name} tem apenas ${chips} fichas. Aposta mínima: ${room.betAmount}.` });
-          // Reduz aposta automaticamente para o mínimo possível
+        if(chips < entryCost) {
+          io.to(room.id||roomId).emit('error', { message: `${p.name} tem apenas ${chips} fichas. Mínimo: ${entryCost}.` });
           return;
         }
       }
+      // Debita entrada de todos
+      for(const p of room.players) {
+        await db.collection('users').doc(p.uid).update({
+          chips: admin.firestore.FieldValue.increment(-entryCost)
+        });
+      }
     }
     room.status = 'playing';
+    if(room.game === 'poker') room.pokerBetVotes = {};
     const matchRef = await db.collection('matches').add({
       roomId, game: room.game,
       betAmount: room.betAmount,
@@ -729,159 +797,142 @@ io.on('connection', socket => {
   socket.on('game_action', ({ roomId, action, data }) => {
     const room = rooms.get(roomId);
 
-    // ── Pife Online: inicializa ──
-
     // ══════════════════════════════════════════
     // POKER ONLINE HANDLERS
     // ══════════════════════════════════════════
 
+    // ── Proposta de aposta antes de iniciar ──
+    if(action === 'poker_bet_proposal') {
+      if(!room) return;
+      const bet = Math.max(5, parseInt(data.bet)||5);
+      if(!room.pokerBetVotes) room.pokerBetVotes = {};
+      room.pokerBetVotes[uid] = bet;
+      // Avisa o adversário que este jogador propôs
+      socket.to(roomId).emit('game_action',{uid,action:'poker_bet_proposal',data:{bet}});
+      return;
+    }
+
+    if(action === 'poker_bet_confirm') {
+      if(!room) return;
+      const bet = Math.max(5, parseInt(data.bet)||5);
+      if(!room.pokerBetVotes) room.pokerBetVotes = {};
+      room.pokerBetVotes[uid] = { bet, confirmed: true };
+      // Avisa o adversário que confirmou
+      socket.to(roomId).emit('game_action',{uid,action:'poker_bet_waiting',data:{}});
+      // Verifica se ambos confirmaram
+      const allConfirmed = room.players.every(p => room.pokerBetVotes[p.uid]?.confirmed);
+      if(allConfirmed) {
+        // Usa a aposta do criador da sala
+        const agreedBet = room.pokerBetVotes[room.players[0].uid]?.bet || bet;
+        room.betAmount = agreedBet;
+        room.pokerBetVotes = {};
+        io.to(roomId).emit('game_action',{uid:'server',action:'poker_bet_agreed',data:{bet:agreedBet}});
+        // Inicia a mão automaticamente
+        setTimeout(()=>startPokerHand(room, roomId, io), 300);
+      }
+      return;
+    }
+
     if(action === 'poker_init') {
       if(!room) return;
-      const BB = room.betAmount || 10;
-      const SB = Math.max(5, Math.floor(BB/2));
-      const suits=['spade','heart','diam','club'];
-      const ranks=['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
-      let deck=[];
-      for(const s of suits) for(const r of ranks)
-        deck.push({rank:r,suit:s,id:`${r}${s}_${Math.random().toString(36).slice(2)}`});
-      for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
-
-      const startChips = BB * 10;
-      const hands = {};
-      const chips = {};
-      room.players.forEach(p => {
-        hands[p.uid] = [deck.pop(), deck.pop()];
-        chips[p.uid] = startChips;
-      });
-
-      // players[0] = dealer (paga SB), players[1] = big blind (paga BB)
-      const dealerUid = room.players[0].uid;
-      const bbUid = room.players[1].uid;
-      chips[dealerUid] -= SB;
-      chips[bbUid] -= BB;
-      const pot = SB + BB;
-      const bets = {};
-      bets[dealerUid] = SB;
-      bets[bbUid] = BB;
-
-      room.pokerState = {
-        deck, hands, chips, bets, pot,
-        community: [],
-        stage: 'pre',
-        curBet: BB,
-        currentTurn: dealerUid, // dealer acts first pre-flop
-        foldedUid: null,
-      };
-
-      // Debit chips from Firestore when game starts
-      // (handled by game_result at end)
-
-      // Send to each player
-      for(const p of room.players) {
-        const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
-        if(pSock) {
-          const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
-          pSock.emit('game_action',{uid:'server',action:'poker_deal',data:{
-            hand: room.pokerState.hands[p.uid],
-            chips: room.pokerState.chips[p.uid],
-            oppChips: room.pokerState.chips[oppUid]||0,
-            pot, myBet: bets[p.uid]||0, oppBet: bets[oppUid]||0,
-            curBet: BB,
-            myTurn: room.pokerState.currentTurn === p.uid,
-          }});
-        }
-      }
+      startPokerHand(room, roomId, io);
       return;
     }
 
     if(action === 'poker_action' && room?.pokerState) {
       const ps = room.pokerState;
       const BB = room.betAmount || 10;
-      const SB = Math.max(5, Math.floor(BB/2));
       const oppUid = room.players.find(p=>p.uid!==uid)?.uid;
       if(ps.currentTurn !== uid) return;
 
       const playerAction = data.action;
+      const myBetNow = ps.bets[uid]||0;
+      const oppBetNow = ps.bets[oppUid]||0;
+
+      function findSock(u){ return [...io.sockets.sockets.values()].find(sk=>sk.data.uid===u); }
 
       if(playerAction === 'fold') {
         ps.foldedUid = uid;
         const winnerId = oppUid;
-        const winnerChips = (ps.chips[winnerId]||0) + ps.pot;
-        ps.chips[winnerId] = winnerChips;
-        // Emit result
+        ps.chips[winnerId] = (ps.chips[winnerId]||0) + ps.pot;
         io.to(roomId).emit('game_action',{uid:'server',action:'poker_fold',data:{
           winnerId,
           myChips: ps.chips[uid]||0,
-          oppChips: winnerChips,
+          oppChips: ps.chips[winnerId],
           pot: 0,
         }});
-        // Chip transaction
-        const bet = room.betAmount||10;
-        io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:bet,
-          winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]});
+        io.to(roomId).emit('game_result',{winnerId,loserId:uid,prize:room.betAmount||10,
+          winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]||0});
         room.pokerState = null;
         return;
       }
 
-      const myBet = ps.bets[uid]||0;
-      const oppBet = ps.bets[oppUid]||0;
-      let nextTurn = oppUid;
-
       if(playerAction === 'check') {
-        // Both checked — advance stage
-        const bothChecked = myBet >= ps.curBet && oppBet >= ps.curBet;
-        if(bothChecked || ps.curBet === 0) {
+        // Se o adversário já checou (curBet=0 e oppBet=0), avança
+        const bothChecked = ps.curBet === 0;
+        if(bothChecked && ps.lastAction === 'check') {
           advancePokerStage(room, roomId, io);
           return;
         }
-      } else if(playerAction === 'call') {
-        const toCall = Math.min(ps.curBet - myBet, ps.chips[uid]);
-        ps.chips[uid] -= toCall;
-        ps.bets[uid] = (ps.bets[uid]||0) + toCall;
-        ps.pot += toCall;
-        // After call, advance stage
-        io.to(roomId).emit('game_action',{uid:'server',action:'poker_action',data:{
-          action:'call', uid,
-          pot: ps.pot, oppChips: ps.chips[uid],
-          oppBet: ps.bets[uid], curBet: ps.curBet,
-          myTurn: false,
-        }});
-        // Send to caller too
-        const callerSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===uid);
-        if(callerSock) callerSock.emit('game_action',{uid:'server',action:'poker_action',data:{
-          action:'called', uid, pot:ps.pot, myTurn:false,
-        }});
-        setTimeout(()=>advancePokerStage(room, roomId, io), 600);
-        return;
-      } else if(playerAction === 'raise') {
-        const amount = data.amount || ps.curBet*2;
-        const toAdd = Math.min(amount - myBet, ps.chips[uid]);
-        ps.chips[uid] -= toAdd;
-        ps.bets[uid] = (ps.bets[uid]||0) + toAdd;
-        ps.pot += toAdd;
-        ps.curBet = ps.bets[uid];
-        // Emit to opponent
-        const oppSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===oppUid);
-        if(oppSock) oppSock.emit('game_action',{uid:'server',action:'poker_action',data:{
-          action:'raise', uid,
-          pot: ps.pot, oppChips: ps.chips[uid],
-          oppBet: ps.bets[uid], curBet: ps.curBet,
-          myTurn: true, raiseAmt: ps.curBet,
-        }});
-        const raiseSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===uid);
-        if(raiseSock) raiseSock.emit('game_action',{uid:'server',action:'poker_action',data:{
-          action:'raised', uid, pot:ps.pot, myTurn:false,
-        }});
+        ps.lastAction = 'check';
         ps.currentTurn = oppUid;
+        const oppSockC = findSock(oppUid);
+        if(oppSockC) oppSockC.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
+          myChips: ps.chips[oppUid], myBet: ps.bets[oppUid]||0,
+          oppChips: ps.chips[uid], oppBet: ps.bets[uid]||0,
+        }});
+        const mySockC = findSock(uid);
+        if(mySockC) mySockC.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'checked', uid, pot:ps.pot, myTurn:false, curBet:0,
+          myChips: ps.chips[uid], myBet: ps.bets[uid]||0,
+        }});
         return;
       }
 
-      // Check — just pass turn
-      ps.currentTurn = nextTurn;
-      const oppSock2 = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===oppUid);
-      if(oppSock2) oppSock2.emit('game_action',{uid:'server',action:'poker_action',data:{
-        action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
-      }});
+      if(playerAction === 'call') {
+        const toCall = Math.min(ps.curBet - myBetNow, ps.chips[uid]||0);
+        ps.chips[uid] = (ps.chips[uid]||0) - toCall;
+        ps.bets[uid] = myBetNow + toCall;
+        ps.pot += toCall;
+        // Emite para ambos
+        const mySockK = findSock(uid);
+        if(mySockK) mySockK.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'called', uid, pot:ps.pot, myTurn:false,
+          myChips:ps.chips[uid], myBet:ps.bets[uid],
+        }});
+        const oppSockK = findSock(oppUid);
+        if(oppSockK) oppSockK.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'call', uid, pot:ps.pot, myTurn:false,
+          oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet,
+        }});
+        setTimeout(()=>advancePokerStage(room, roomId, io), 600);
+        return;
+      }
+
+      if(playerAction === 'raise') {
+        const amount = Math.max(ps.curBet+1, parseInt(data.amount)||ps.curBet*2||BB);
+        const toAdd = Math.min(amount - myBetNow, ps.chips[uid]||0);
+        if(toAdd <= 0) return;
+        ps.chips[uid] = (ps.chips[uid]||0) - toAdd;
+        ps.bets[uid] = myBetNow + toAdd;
+        ps.pot += toAdd;
+        ps.curBet = ps.bets[uid];
+        ps.lastAction = 'raise';
+        ps.currentTurn = oppUid;
+        const mySockR = findSock(uid);
+        if(mySockR) mySockR.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'raised', uid, pot:ps.pot, myTurn:false,
+          myChips:ps.chips[uid], myBet:ps.bets[uid], curBet:ps.curBet,
+        }});
+        const oppSockR = findSock(oppUid);
+        if(oppSockR) oppSockR.emit('game_action',{uid:'server',action:'poker_action',data:{
+          action:'raise', uid, pot:ps.pot, myTurn:true,
+          oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet,
+          raiseAmt: ps.curBet,
+        }});
+        return;
+      }
       return;
     }
 
