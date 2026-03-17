@@ -635,13 +635,12 @@ io.on('connection', socket => {
 
   // ── Criar sala ──────────────────────────────────────────
   socket.on('create_room', async ({ game, betAmount, maxPlayers=4 }) => {
-    // Valida maxPlayers
     const max = Math.min(Math.max(parseInt(maxPlayers)||2, 2), 4);
-    // Verifica saldo
     const snap = await db.collection('users').doc(uid).get();
     const balance = snap.data().chips;
-    if (balance < betAmount) {
-      socket.emit('error', { message: 'Saldo insuficiente' });
+    const createCost = game === 'poker' ? 5 : betAmount;
+    if (balance < createCost) {
+      socket.emit('error', { message: `Saldo insuficiente! Você tem ${balance} fichas e precisa de ${createCost}.` });
       return;
     }
 
@@ -704,8 +703,9 @@ io.on('connection', socket => {
     // Verifica saldo antes de entrar
     const joinSnap = await db.collection('users').doc(uid).get();
     const joinBalance = joinSnap.exists ? (joinSnap.data().chips || 0) : 0;
-    if (joinBalance < room.betAmount) {
-      socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e a aposta é ${room.betAmount}.` });
+    const joinCost = room.game === 'poker' ? 5 : room.betAmount;
+    if (joinBalance < joinCost) {
+      socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e precisa de ${joinCost}.` });
       return;
     }
 
