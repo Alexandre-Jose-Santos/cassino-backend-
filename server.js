@@ -412,6 +412,69 @@ function scheduleReset(room, roomId) {
 }
 
 
+function startPokerHand(room, roomId, io) {
+  if(!room || room.players.length < 2) return;
+  const BB = room.betAmount || 10;
+  const SB = Math.floor(BB / 2);
+
+  // Build deck using {rank, suit}
+  const ranks = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+  const suits = ['s','h','d','c'];
+  const deck = [];
+  for(const s of suits) for(const r of ranks) deck.push({rank:r,suit:s});
+  // Shuffle
+  for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}
+
+  if(!room.pokerDealerIdx) room.pokerDealerIdx = 0;
+  const dealerIdx = room.pokerDealerIdx % 2;
+  const p0 = room.players[dealerIdx].uid;   // dealer / SB
+  const p1 = room.players[1-dealerIdx].uid; // BB
+
+  const hands = {
+    [p0]: [deck.pop(), deck.pop()],
+    [p1]: [deck.pop(), deck.pop()],
+  };
+
+  const startChips = {};
+  room.players.forEach(p => {
+    startChips[p.uid] = (room.pokerState?.chips?.[p.uid]) || 100;
+  });
+
+  room.pokerState = {
+    deck, hands,
+    community: [],
+    stage: 'pre',
+    pot: SB + BB,
+    curBet: BB,
+    bets: { [p0]: SB, [p1]: BB },
+    chips: {
+      [p0]: startChips[p0] - SB,
+      [p1]: startChips[p1] - BB,
+    },
+    currentTurn: p0, // SB acts first pre-flop
+    checkedUids: new Set(),
+  };
+
+  // Send cards to each player
+  for(const p of room.players) {
+    const pSock = [...io.sockets.sockets.values()].find(sk=>sk.data.uid===p.uid);
+    const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
+    if(pSock) pSock.emit('game_action', {uid:'server', action:'poker_deal', data:{
+      hand: room.pokerState.hands[p.uid],
+      chips: room.pokerState.chips[p.uid],
+      oppChips: room.pokerState.chips[oppUid]||0,
+      pot: room.pokerState.pot,
+      curBet: room.pokerState.curBet,
+      myBet: room.pokerState.bets[p.uid]||0,
+      oppBet: room.pokerState.bets[oppUid]||0,
+      myTurn: room.pokerState.currentTurn === p.uid,
+      dealer: p.uid === p0,
+      stage: 'pre',
+    }});
+  }
+  console.log('🃏 Poker hand started in room', roomId);
+}
+
 function advancePokerStage(room, roomId, io) {
   const ps = room.pokerState;
   if(!ps) return;
@@ -771,6 +834,35 @@ io.on('connection', socket => {
     }
 
     // poker_init removido — fluxo correto: poker_bet_proposal -> poker_bet_confirm -> poker_bet_agreed -> startPokerHand
+
+    // ── Negociação de aposta para jogos não-poker ──────────────
+    if(action === 'game_bet_proposal') {
+      if(!room) return;
+      const bet = Math.max(5, parseInt(data.bet)||5);
+      if(!room.gameBetVotes) room.gameBetVotes = {};
+      room.gameBetVotes[uid] = bet;
+      socket.to(roomId).emit('game_action',{uid, action:'game_bet_proposal', data:{bet}});
+      return;
+    }
+    if(action === 'game_bet_confirm') {
+      if(!room) return;
+      const bet = Math.max(5, parseInt(data.bet)||5);
+      if(!room.gameBetVotes) room.gameBetVotes = {};
+      room.gameBetVotes[uid] = { bet, confirmed: true };
+      socket.to(roomId).emit('game_action',{uid, action:'game_bet_waiting', data:{}});
+      const allConfirmed = room.players.length >= 2 &&
+        room.players.every(p => room.gameBetVotes[p.uid]?.confirmed === true);
+      if(allConfirmed) {
+        const bets = room.players.map(p => {
+          const v = room.gameBetVotes[p.uid];
+          return typeof v === 'object' ? (v.bet||5) : (v||5);
+        });
+        room.betAmount = Math.max(...bets);
+        room.gameBetVotes = {};
+        io.to(roomId).emit('game_action',{uid:'server', action:'game_bet_agreed', data:{bet:room.betAmount}});
+      }
+      return;
+    }
 
     if(action === 'poker_action' && room?.pokerState) {
       const ps = room.pokerState;
