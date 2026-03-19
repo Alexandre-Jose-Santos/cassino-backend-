@@ -897,13 +897,15 @@ io.on('connection', socket => {
         if(ps.checkedUids.size >= 2) { advancePokerStage(room, roomId, io); return; }
         ps.currentTurn = oppUid;
         const oppSockC = findSock(oppUid);
-        if(oppSockC) oppSockC.emit('game_action',{uid:'server', action:'poker_action', data:{
+        // Envia para o adversário: é a vez dele agir (check do oponente)
+        if(oppSockC) oppSockC.emit('game_action',{uid:oppUid, action:'poker_action', data:{
           action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
           myChips:ps.chips[oppUid]||0, myBet:ps.bets[oppUid]||0,
           oppChips:ps.chips[uid]||0, oppBet:ps.bets[uid]||0,
         }});
+        // Confirma para quem checkeu: aguarda adversário
         const mySockC = findSock(uid);
-        if(mySockC) mySockC.emit('game_action',{uid:'server', action:'poker_action', data:{
+        if(mySockC) mySockC.emit('game_action',{uid:uid, action:'poker_action', data:{
           action:'checked', uid, pot:ps.pot, myTurn:false, curBet:0,
           myChips:ps.chips[uid]||0, myBet:ps.bets[uid]||0,
         }});
@@ -917,12 +919,12 @@ io.on('connection', socket => {
         ps.pot += toCall;
         ps.checkedUids = new Set();
         const mySockK = findSock(uid);
-        if(mySockK) mySockK.emit('game_action',{uid:'server', action:'poker_action', data:{
+        if(mySockK) mySockK.emit('game_action',{uid:uid, action:'poker_action', data:{
           action:'called', uid, pot:ps.pot, myTurn:false,
           myChips:ps.chips[uid], myBet:ps.bets[uid],
         }});
         const oppSockK = findSock(oppUid);
-        if(oppSockK) oppSockK.emit('game_action',{uid:'server', action:'poker_action', data:{
+        if(oppSockK) oppSockK.emit('game_action',{uid:uid, action:'poker_action', data:{
           action:'call', uid, pot:ps.pot, myTurn:false,
           oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet,
         }});
@@ -942,12 +944,12 @@ io.on('connection', socket => {
         ps.checkedUids = new Set();
         ps.currentTurn = oppUid;
         const mySockR = findSock(uid);
-        if(mySockR) mySockR.emit('game_action',{uid:'server', action:'poker_action', data:{
+        if(mySockR) mySockR.emit('game_action',{uid:uid, action:'poker_action', data:{
           action:'raised', uid, pot:ps.pot, myTurn:false,
           myChips:ps.chips[uid], myBet:ps.bets[uid], curBet:ps.curBet,
         }});
         const oppSockR = findSock(oppUid);
-        if(oppSockR) oppSockR.emit('game_action',{uid:'server', action:'poker_action', data:{
+        if(oppSockR) oppSockR.emit('game_action',{uid:uid, action:'poker_action', data:{
           action:'raise', uid, pot:ps.pot, myTurn:true,
           oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet, raiseAmt:ps.curBet,
         }});
