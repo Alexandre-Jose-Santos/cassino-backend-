@@ -34,21 +34,9 @@ const io = new Server(server, {
 setInterval(() => {
   const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
   if (!domain) return;
-  try {
-    require('https').get(`https://${domain}/health`, r => {
-      console.log(`💓 Keep-alive: ${r.statusCode} | salas: ${rooms.size} | conexoes: ${io.sockets.sockets.size}`);
-    }).on('error', e => console.warn('Keep-alive falhou (ignorado):', e.message));
-  } catch(e) {
-    console.warn('Keep-alive erro (ignorado):', e.message);
-  }
-  // Limpa salas travadas em 'waiting' há mais de 1 hora
-  const now = Date.now();
-  rooms.forEach((r, id) => {
-    if (r.status === 'waiting' && (now - (r.createdAt||now)) > 60*60*1000) {
-      rooms.delete(id);
-      console.log(`🧹 Sala ${id} removida por inatividade`);
-    }
-  });
+  require('https').get(`https://${domain}/health`, r => {
+    console.log(`💓 Keep-alive: ${r.statusCode} | salas: ${rooms.size} | conexões: ${io.sockets.sockets.size}`);
+  }).on('error', e => console.warn('Keep-alive falhou:', e.message));
 }, 3 * 60 * 1000); // a cada 3 minutos
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
@@ -567,97 +555,90 @@ io.on('connection', socket => {
 
   // ── Criar sala ──────────────────────────────────────────
   socket.on('create_room', async ({ game, betAmount, maxPlayers=4 }) => {
-    try {
-      const max = Math.min(Math.max(parseInt(maxPlayers)||2, 2), 4);
-      const snap = await db.collection('users').doc(uid).get();
-      const balance = snap.data().chips;
-      const createCost = game === 'poker' ? 5 : betAmount;
-      if (balance < createCost) {
-        socket.emit('error', { message: `Saldo insuficiente! Voce tem ${balance} fichas e precisa de ${createCost}.` });
-        return;
-      }
-      const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
-      rooms.set(roomId, {
-        id: roomId, game, betAmount, maxPlayers: max,
-        players: [{ uid, name: user.name, avatar: user.avatar, ready: false, online: true }],
-        status: 'waiting',
-        createdAt: Date.now(),
-      });
-      socket.join(roomId);
-      socket.emit('room_created', { roomId, room: rooms.get(roomId) });
-      io.to('lobby').emit('rooms_update', getRoomsList());
-    } catch(e) {
-      console.error('create_room erro:', e.message);
-      socket.emit('error', { message: 'Erro ao criar sala. Tente novamente.' });
+    // Valida maxPlayers
+    const max = Math.min(Math.max(parseInt(maxPlayers)||2, 2), 4);
+    const snap = await db.collection('users').doc(uid).get();
+    const balance = snap.data().chips;
+    const createCost = game === 'poker' ? 5 : betAmount;
+    if (balance < createCost) {
+      socket.emit('error', { message: `Saldo insuficiente! Você tem ${balance} fichas e precisa de ${createCost}.` });
+      return;
     }
+
+    const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
+    rooms.set(roomId, {
+      id: roomId, game, betAmount, maxPlayers: max,
+      players: [{ uid, name: user.name, avatar: user.avatar, ready: false, online: true }],
+      status: 'waiting',
+      createdAt: Date.now(),
+    });
+
+    socket.join(roomId);
+    socket.emit('room_created', { roomId, room: rooms.get(roomId) });
+    io.to('lobby').emit('rooms_update', getRoomsList());
   });
 
   // ── Entrar em sala ──────────────────────────────────────
   socket.on('join_room', async ({ roomId }) => {
-    try {
-      const room = rooms.get(roomId);
-      if (!room) { socket.emit('error', { message: 'Sala não encontrada' }); return; }
-  
-      // ── Reconexão: jogador já estava na sala (durante partida ou na espera) ──
-      const jaEstaNaSala = room.players.find(p => p.uid === uid);
-      if (jaEstaNaSala) {
-        jaEstaNaSala.online = true;
-        jaEstaNaSala.disconnectedAt = null;
-        jaEstaNaSala.socketId = socket.id;
-        socket.join(roomId);
-        // Envia estado completo da sala + estado do jogo atual
-        socket.emit('room_joined', { room });
-        socket.emit('room_update', room);
-        // Reenvía estado do jogo em andamento se houver
-        if (room.status === 'playing') {
-          // Dama: reenvia board atual
-          if (room.game === 'dama' && room.damaBoard) {
-            socket.emit('game_action', {
-              action: 'dama_update',
-              data: { board: room.damaBoard, turn: room.damaTurn || 'w' }
-            });
-            // Reenvia as cores
-            const colorMap = {};
-            room.players.forEach(p => { if(p.damaColor) colorMap[p.uid] = p.damaColor; });
-            socket.emit('game_action', { action: 'dama_init', data: { colorMap } });
-          }
-          // Dominó, Xadrez, etc: reenvia room_update que inclui game state
-          socket.emit('game_action', { action: 'reconnected', data: { game: room.game } });
-        }
-        io.to(roomId).emit('room_update', room);
-        io.to(roomId).emit('player_online', { uid, name: jaEstaNaSala.name });
-        io.to('lobby').emit('rooms_update', getRoomsList());
-        console.log(`🔄 ${jaEstaNaSala.name} reconectou à sala ${roomId}`);
-        return;
-      }
-  
-      // Bloqueia entrada de NOVO jogador se jogo já iniciado
-      if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
-  
-      if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
-  
-      // Verifica saldo antes de entrar
-      const joinSnap = await db.collection('users').doc(uid).get();
-      const joinBalance = joinSnap.exists ? (joinSnap.data().chips || 0) : 0;
-      const joinCost = room.game === 'poker' ? 5 : room.betAmount;
-      if (joinBalance < joinCost) {
-        socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e precisa de ${joinCost}.` });
-        return;
-      }
-  
-      room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
+    const room = rooms.get(roomId);
+    if (!room) { socket.emit('error', { message: 'Sala não encontrada' }); return; }
+
+    // ── Reconexão: jogador já estava na sala (durante partida ou na espera) ──
+    const jaEstaNaSala = room.players.find(p => p.uid === uid);
+    if (jaEstaNaSala) {
+      jaEstaNaSala.online = true;
+      jaEstaNaSala.disconnectedAt = null;
+      jaEstaNaSala.socketId = socket.id;
       socket.join(roomId);
-      // Confirma entrada para quem entrou
+      // Envia estado completo da sala + estado do jogo atual
       socket.emit('room_joined', { room });
-      // Avisa todos na sala
+      socket.emit('room_update', room);
+      // Reenvía estado do jogo em andamento se houver
+      if (room.status === 'playing') {
+        // Dama: reenvia board atual
+        if (room.game === 'dama' && room.damaBoard) {
+          socket.emit('game_action', {
+            action: 'dama_update',
+            data: { board: room.damaBoard, turn: room.damaTurn || 'w' }
+          });
+          // Reenvia as cores
+          const colorMap = {};
+          room.players.forEach(p => { if(p.damaColor) colorMap[p.uid] = p.damaColor; });
+          socket.emit('game_action', { action: 'dama_init', data: { colorMap } });
+        }
+        // Dominó, Xadrez, etc: reenvia room_update que inclui game state
+        socket.emit('game_action', { action: 'reconnected', data: { game: room.game } });
+      }
       io.to(roomId).emit('room_update', room);
+      io.to(roomId).emit('player_online', { uid, name: jaEstaNaSala.name });
       io.to('lobby').emit('rooms_update', getRoomsList());
-    
-    } catch(e) {
-      console.error('join_room erro:', e.message);
-      socket.emit('error', { message: 'Erro ao entrar na sala. Tente novamente.' });
+      console.log(`🔄 ${jaEstaNaSala.name} reconectou à sala ${roomId}`);
+      return;
     }
+
+    // Bloqueia entrada de NOVO jogador se jogo já iniciado
+    if (room.status !== 'waiting') { socket.emit('error', { message: 'Jogo já iniciado' }); return; }
+
+    if (room.players.length >= (room.maxPlayers||4)) { socket.emit('error', { message: 'Sala cheia' }); return; }
+
+    // Verifica saldo antes de entrar
+    const joinSnap = await db.collection('users').doc(uid).get();
+    const joinBalance = joinSnap.exists ? (joinSnap.data().chips || 0) : 0;
+    const joinCost = room.game === 'poker' ? 5 : room.betAmount;
+    if (joinBalance < joinCost) {
+      socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e precisa de ${joinCost}.` });
+      return;
+    }
+
+    room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
+    socket.join(roomId);
+    // Confirma entrada para quem entrou
+    socket.emit('room_joined', { room });
+    // Avisa todos na sala
+    io.to(roomId).emit('room_update', room);
+    io.to('lobby').emit('rooms_update', getRoomsList());
   });
+
   // ── Player pronto ──────────────────────────────────────
   // ── Player pronto ─────────────────────────────────────────
   socket.on('player_ready', ({ roomId }) => {
@@ -680,50 +661,45 @@ io.on('connection', socket => {
 
   // ── Iniciar jogo (criador, todos prontos) — SEM debitar fichas ──
   socket.on('start_game', async ({ roomId }) => {
-    try {
-      const room = rooms.get(roomId);
-      if (!room || room.status !== 'waiting') return;
-      if (room.players[0].uid !== uid) {
-        socket.emit('error', { message: 'Só quem criou a sala pode iniciar.' });
-        return;
-      }
-      if (room.players.length < 2) {
-        socket.emit('error', { message: 'Precisa de pelo menos 2 jogadores.' });
-        return;
-      }
-      if (!room.players.every(p => p.ready)) {
-        socket.emit('error', { message: 'Nem todos estão prontos.' });
-        return;
-      }
-      const entryCost = room.game === 'poker' ? 5 : (room.betAmount || 0);
-      if(entryCost > 0) {
-        for(const p of room.players) {
-          const snap = await db.collection('users').doc(p.uid).get();
-          const chips = snap.exists ? (snap.data().chips||0) : 0;
-          if(chips < entryCost) { io.to(room.id||roomId).emit('error',{message:`${p.name} tem apenas ${chips} fichas. Mínimo: ${entryCost}.`}); return; }
-        }
-        for(const p of room.players) {
-          await db.collection('users').doc(p.uid).update({chips:admin.firestore.FieldValue.increment(-entryCost)}).catch(()=>{});
-        }
-      }
-      if(room.game==='poker') room.pokerBetVotes={};
-      room.status = 'playing';
-      const matchRef = await db.collection('matches').add({
-        roomId, game: room.game,
-        betAmount: room.betAmount,
-        players: room.players.map(p => p.uid),
-        status: 'playing',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      room.matchId = matchRef.id;
-      io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
-      console.log(`🎮 Jogo: ${room.game} sala ${roomId}`);
-    
-    } catch(e) {
-      console.error('start_game erro:', e.message);
-      socket.emit('error', { message: 'Erro ao iniciar jogo. Tente novamente.' });
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'waiting') return;
+    if (room.players[0].uid !== uid) {
+      socket.emit('error', { message: 'Só quem criou a sala pode iniciar.' });
+      return;
     }
+    if (room.players.length < 2) {
+      socket.emit('error', { message: 'Precisa de pelo menos 2 jogadores.' });
+      return;
+    }
+    if (!room.players.every(p => p.ready)) {
+      socket.emit('error', { message: 'Nem todos estão prontos.' });
+      return;
+    }
+    const entryCost = room.game === 'poker' ? 5 : (room.betAmount || 0);
+    if(entryCost > 0) {
+      for(const p of room.players) {
+        const snap = await db.collection('users').doc(p.uid).get();
+        const chips = snap.exists ? (snap.data().chips||0) : 0;
+        if(chips < entryCost) { io.to(room.id||roomId).emit('error',{message:`${p.name} tem apenas ${chips} fichas. Mínimo: ${entryCost}.`}); return; }
+      }
+      for(const p of room.players) {
+        await db.collection('users').doc(p.uid).update({chips:admin.firestore.FieldValue.increment(-entryCost)}).catch(()=>{});
+      }
+    }
+    if(room.game==='poker') room.pokerBetVotes={};
+    room.status = 'playing';
+    const matchRef = await db.collection('matches').add({
+      roomId, game: room.game,
+      betAmount: room.betAmount,
+      players: room.players.map(p => p.uid),
+      status: 'playing',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    room.matchId = matchRef.id;
+    io.to(roomId).emit('game_start', { room, matchId: matchRef.id });
+    console.log(`🎮 Jogo: ${room.game} sala ${roomId}`);
   });
+
   // ── Proposta de mudança de aposta (durante o jogo) ────────
   socket.on('propose_bet', ({ roomId, newBet }) => {
     const room = rooms.get(roomId);
@@ -794,15 +770,7 @@ io.on('connection', socket => {
       return;
     }
 
-    if(action === 'poker_init') {
-      if(!room) return;
-      // Fallback: inicia direto se betAmount já definido
-      if(!room.betAmount) room.betAmount = 5;
-      room.pokerBetVotes = {};
-      io.to(roomId).emit('game_action',{uid:'server', action:'poker_bet_agreed', data:{bet:room.betAmount}});
-      setTimeout(() => startPokerHand(room, roomId, io), 400);
-      return;
-    }
+    // poker_init removido — fluxo correto: poker_bet_proposal -> poker_bet_confirm -> poker_bet_agreed -> startPokerHand
 
     if(action === 'poker_action' && room?.pokerState) {
       const ps = room.pokerState;
@@ -1541,71 +1509,67 @@ io.on('connection', socket => {
 
   // ── Fim de jogo ─────────────────────────────────────────
   socket.on('game_over', async ({ roomId, winnerId, loserId }) => {
-    try {
-      const room = rooms.get(roomId);
-      if (!room || room.status !== 'playing') return;
-      room.status = 'finished';
-  
-      const bet = room.betAmount || 0;
-  
-      // Debita do perdedor e credita no vencedor
-      if (bet > 0 && winnerId && loserId && winnerId !== loserId) {
-        try {
-          const batch = db.batch();
-          // Verifica saldo do perdedor
-          const loserSnap = await db.collection('users').doc(loserId).get();
-          const loserChips = loserSnap.exists ? (loserSnap.data().chips || 0) : 0;
-          const debit = Math.min(bet, loserChips); // nunca vai negativo
-  
-          if (debit > 0) {
-            batch.update(db.collection('users').doc(loserId), {
-              chips: admin.firestore.FieldValue.increment(-debit),
-            });
-            batch.update(db.collection('users').doc(winnerId), {
-              chips: admin.firestore.FieldValue.increment(debit),
-            });
-            await batch.commit();
-            await logTransaction(winnerId, 'win',  debit, `Vitória em ${room.game}`);
-            await logTransaction(loserId,  'loss', -debit, `Derrota em ${room.game}`);
-          }
-  
-          // Notifica resultado com saldos atualizados
-          const [wSnap, lSnap] = await Promise.all([
-            db.collection('users').doc(winnerId).get(),
-            db.collection('users').doc(loserId).get(),
-          ]);
-          io.to(roomId).emit('game_result', {
-            winnerId, loserId, prize: debit,
-            winnerChips: wSnap.data()?.chips || 0,
-            loserChips:  lSnap.data()?.chips || 0,
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'playing') return;
+    room.status = 'finished';
+
+    const bet = room.betAmount || 0;
+
+    // Debita do perdedor e credita no vencedor
+    if (bet > 0 && winnerId && loserId && winnerId !== loserId) {
+      try {
+        const batch = db.batch();
+        // Verifica saldo do perdedor
+        const loserSnap = await db.collection('users').doc(loserId).get();
+        const loserChips = loserSnap.exists ? (loserSnap.data().chips || 0) : 0;
+        const debit = Math.min(bet, loserChips); // nunca vai negativo
+
+        if (debit > 0) {
+          batch.update(db.collection('users').doc(loserId), {
+            chips: admin.firestore.FieldValue.increment(-debit),
           });
-        } catch(e) {
-          console.error('Erro ao processar resultado:', e);
-          io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
+          batch.update(db.collection('users').doc(winnerId), {
+            chips: admin.firestore.FieldValue.increment(debit),
+          });
+          await batch.commit();
+          await logTransaction(winnerId, 'win',  debit, `Vitória em ${room.game}`);
+          await logTransaction(loserId,  'loss', -debit, `Derrota em ${room.game}`);
         }
-      } else {
+
+        // Notifica resultado com saldos atualizados
+        const [wSnap, lSnap] = await Promise.all([
+          db.collection('users').doc(winnerId).get(),
+          db.collection('users').doc(loserId).get(),
+        ]);
+        io.to(roomId).emit('game_result', {
+          winnerId, loserId, prize: debit,
+          winnerChips: wSnap.data()?.chips || 0,
+          loserChips:  lSnap.data()?.chips || 0,
+        });
+      } catch(e) {
+        console.error('Erro ao processar resultado:', e);
         io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
       }
-  
-      // Incrementa vitórias do vencedor na sala
-      if(winnerId) {
-        const wp = room.players.find(p=>p.uid===winnerId);
-        if(wp) { wp.score = (wp.score||0)+1; }
-      }
-      if (room.matchId) {
-        await db.collection('matches').doc(room.matchId).update({
-          status: 'finished', winnerId, loserId,
-          finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }).catch(()=>{});
-      }
-  
-      rooms.delete(roomId);
-      io.to('lobby').emit('rooms_update', getRoomsList());
-    
-    } catch(e) {
-      console.error('game_over erro:', e.message);
+    } else {
+      io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
     }
+
+    // Incrementa vitórias do vencedor na sala
+    if(winnerId) {
+      const wp = room.players.find(p=>p.uid===winnerId);
+      if(wp) { wp.score = (wp.score||0)+1; }
+    }
+    if (room.matchId) {
+      await db.collection('matches').doc(room.matchId).update({
+        status: 'finished', winnerId, loserId,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(()=>{});
+    }
+
+    rooms.delete(roomId);
+    io.to('lobby').emit('rooms_update', getRoomsList());
   });
+
   // ── Atualiza lista de salas sob demanda ──────────────────
   socket.on('get_rooms', () => {
     socket.emit('rooms_update', getRoomsList());
@@ -1817,27 +1781,15 @@ function getRoomsList() {
 }
 
 async function logTransaction(userId, type, chips, description) {
-  try {
-    await db.collection('transactions').add({
-      userId, type, chips, description,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  } catch(e) {
-    console.error('logTransaction erro (ignorado):', e.message);
-  }
+  await db.collection('transactions').add({
+    userId, type, chips, description,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
 }
 
 // ── Health check ─────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', rooms: rooms.size }));
 app.get('/api/packages', (_, res) => res.json(PACKAGES));
-
-// ── Proteção global — impede que o servidor caia ─────────────
-process.on('uncaughtException', err => {
-  console.error('❌ uncaughtException (servidor continua):', err.message, err.stack);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ unhandledRejection (servidor continua):', reason);
-});
 
 // ── Start ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
