@@ -630,6 +630,10 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
+    // Debita 5 fichas de entrada ao criar a sala
+    await db.collection('users').doc(uid).update({
+      chips: admin.firestore.FieldValue.increment(-5)
+    }).catch(()=>{});
 
     const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
     rooms.set(roomId, {
@@ -696,6 +700,10 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
+    // Debita 5 fichas de entrada ao entrar na sala
+    await db.collection('users').doc(uid).update({
+      chips: admin.firestore.FieldValue.increment(-5)
+    }).catch(()=>{});
 
     room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
     socket.join(roomId);
@@ -742,22 +750,7 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
-    // Cobrar 5 fichas de entrada de cada jogador (taxa de entrada na sala)
-    const ENTRY_FEE = 5;
-    for(const p of room.players) {
-      const snap = await db.collection('users').doc(p.uid).get();
-      const chips = snap.exists ? (snap.data().chips||0) : 0;
-      if(chips < ENTRY_FEE) {
-        io.to(room.id||roomId).emit('error',{message:`${p.name} nao tem fichas suficientes. Minimo: ${ENTRY_FEE}.`});
-        return;
-      }
-    }
-    for(const p of room.players) {
-      await db.collection('users').doc(p.uid).update({
-        chips: admin.firestore.FieldValue.increment(-ENTRY_FEE)
-      }).catch(()=>{});
-    }
-    console.log('💰 5 fichas cobradas de cada jogador na sala', roomId);
+    // Entrada ja foi cobrada ao criar/entrar na sala — sem deducao adicional aqui
     if(room.game==='poker') room.pokerBetVotes={};
     room.status = 'playing';
     const matchRef = await db.collection('matches').add({
