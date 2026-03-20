@@ -833,7 +833,20 @@ io.on('connection', socket => {
       return;
     }
 
-    // poker_init removido — fluxo correto: poker_bet_proposal -> poker_bet_confirm -> poker_bet_agreed -> startPokerHand
+    if(action === 'poker_init') {
+      if(!room) return;
+      // Marca este jogador como pronto
+      if(!room.pokerInitVotes) room.pokerInitVotes = new Set();
+      room.pokerInitVotes.add(uid);
+      console.log(`🃏 poker_init de ${uid}, votos: ${room.pokerInitVotes.size}/${room.players.length}`);
+      // Inicia quando ambos enviaram poker_init
+      if(room.pokerInitVotes.size >= room.players.length) {
+        room.pokerInitVotes = new Set(); // reset para próxima mão
+        if(!room.betAmount) room.betAmount = 5;
+        startPokerHand(room, roomId, io);
+      }
+      return;
+    }
 
     // ── Negociação de aposta para jogos não-poker ──────────────
     if(action === 'game_bet_proposal') {
