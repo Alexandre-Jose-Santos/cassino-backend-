@@ -605,11 +605,7 @@ function doPokerShowdown(room, roomId, io) {
 
   const prize=ps.pot;
   io.to(roomId).emit('game_result',{winnerId:tie?null:winnerId,loserId:tie?null:loserId,prize,winnerChips:tie?null:ps.chips[winnerId],loserChips:tie?null:ps.chips[loserId]});
-  if(!tie&&winnerId&&loserId&&prize>0){
-    const half=Math.floor(prize/2);
-    db.collection('users').doc(loserId).update({chips:admin.firestore.FieldValue.increment(-half)}).catch(()=>{});
-    db.collection('users').doc(winnerId).update({chips:admin.firestore.FieldValue.increment(half)}).catch(()=>{});
-  }
+  // Fichas do pote sao in-memory apenas — sem debito/credito no Firestore aqui
   room.pokerState=null;
 }
 
@@ -885,11 +881,7 @@ io.on('connection', socket => {
         const prize = ps.pot;
         io.to(roomId).emit('game_result',{winnerId, loserId:uid, prize,
           winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]||0});
-        if(prize > 0) {
-          const half = Math.floor(prize/2);
-          db.collection('users').doc(uid).update({chips: admin.firestore.FieldValue.increment(-half)}).catch(()=>{});
-          db.collection('users').doc(winnerId).update({chips: admin.firestore.FieldValue.increment(half)}).catch(()=>{});
-        }
+        // Fichas do pote sao in-memory apenas — sem debito/credito no Firestore aqui
         room.pokerState = null;
         return;
       }
@@ -1410,26 +1402,8 @@ io.on('connection', socket => {
         io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:uid,loserId,nojada,mult}});
         // Debita/credita
         const bet=room.betAmount||0;
-        if(bet>0&&loserId){
-          (async()=>{
-            try{
-              const lSnap=await db.collection('users').doc(loserId).get();
-              const lChips=lSnap.exists?(lSnap.data().chips||0):0;
-              const debit=Math.min(bet*mult,Math.max(0,lChips));
-              if(debit>0){
-                const batch=db.batch();
-                batch.update(db.collection('users').doc(loserId),{chips:admin.firestore.FieldValue.increment(-debit)});
-                batch.update(db.collection('users').doc(uid),{chips:admin.firestore.FieldValue.increment(debit)});
-                await batch.commit();
-                await logTransaction(uid,'win',debit,`Dominó — vitória`);
-                await logTransaction(loserId,'loss',-debit,`Dominó — derrota`);
-                const [wS,lS]=await Promise.all([db.collection('users').doc(uid).get(),db.collection('users').doc(loserId).get()]);
-                io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
-              const wdom = room.players.find(p=>p.uid===uid); if(wdom) wdom.score=(wdom.score||0)+1;
-              }
-            }catch(e){console.error('Erro dominó:',e);}
-          })();
-        }
+        io.to(roomId).emit('game_result',{winnerId:uid,loserId,prize:0});
+        const wdom = room.players.find(p=>p.uid===uid); if(wdom) wdom.score=(wdom.score||0)+1;
       }
       return;
     }
@@ -1485,26 +1459,8 @@ io.on('connection', socket => {
         io.to(roomId).emit('game_action',{uid:'server',action:'domino_win',data:{winnerId:winner,loserId:loser,scores,reason:'bateu'}});
         // Debita/credita fichas
         const bet=room.betAmount||0;
-        if(bet>0&&winner&&loser){
-          (async()=>{
-            try{
-              const lSnap=await db.collection('users').doc(loser).get();
-              const lChips=lSnap.exists?(lSnap.data().chips||0):0;
-              const debit=Math.min(bet,Math.max(0,lChips));
-              if(debit>0){
-                const batch=db.batch();
-                batch.update(db.collection('users').doc(loser),{chips:admin.firestore.FieldValue.increment(-debit)});
-                batch.update(db.collection('users').doc(winner),{chips:admin.firestore.FieldValue.increment(debit)});
-                await batch.commit();
-                await logTransaction(winner,'win',debit,'Dominó — bateu');
-                await logTransaction(loser,'loss',-debit,'Dominó — perdeu no bate');
-                const [wS,lS]=await Promise.all([db.collection('users').doc(winner).get(),db.collection('users').doc(loser).get()]);
-                io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:debit,winnerChips:wS.data()?.chips||0,loserChips:lS.data()?.chips||0});
-              const wdom = room.players.find(p=>p.uid===winner); if(wdom) wdom.score=(wdom.score||0)+1;
-              }
-            }catch(e){console.error('Erro bate dominó:',e);}
-          })();
-        }
+        io.to(roomId).emit('game_result',{winnerId:winner,loserId:loser,prize:0});
+        const wdom2 = room.players.find(p=>p.uid===winner); if(wdom2) wdom2.score=(wdom2.score||0)+1;
       }
       return;
     }
@@ -1587,27 +1543,7 @@ io.on('connection', socket => {
       const winnerId = room.players.find(p => p.uid !== uid)?.uid;
       const loserId = uid;
       io.to(roomId).emit('game_action', { action: 'dama_win', data: { winnerId, loserId } });
-      const bet = room.betAmount || 0;
-      if (bet > 0 && winnerId) {
-        (async () => {
-          try {
-            const lSnap = await db.collection('users').doc(loserId).get();
-            const lChips = lSnap.exists ? (lSnap.data().chips || 0) : 0;
-            const debit = Math.min(bet, Math.max(0, lChips));
-            if (debit > 0) {
-              const batch = db.batch();
-              batch.update(db.collection('users').doc(loserId), { chips: admin.firestore.FieldValue.increment(-debit) });
-              batch.update(db.collection('users').doc(winnerId), { chips: admin.firestore.FieldValue.increment(debit) });
-              await batch.commit();
-            }
-            const [wS, lS] = await Promise.all([
-              db.collection('users').doc(winnerId).get(),
-              db.collection('users').doc(loserId).get()
-            ]);
-            io.to(roomId).emit('game_result', { winnerId, loserId, prize: bet, winnerChips: wS.data()?.chips || 0, loserChips: lS.data()?.chips || 0 });
-          } catch(e) { console.error('dama_forfeit error:', e); }
-        })();
-      }
+      io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
       scheduleReset(room, roomId);
     }
 
@@ -1638,67 +1574,29 @@ io.on('connection', socket => {
 
   // ── Fim de jogo ─────────────────────────────────────────
   socket.on('game_over', async ({ roomId, winnerId, loserId }) => {
-    const room = rooms.get(roomId);
-    if (!room || room.status !== 'playing') return;
-    room.status = 'finished';
+    try {
+      const room = rooms.get(roomId);
+      if (!room || room.status !== 'playing') return;
+      room.status = 'finished';
 
-    const bet = room.betAmount || 0;
-
-    // Debita do perdedor e credita no vencedor
-    if (bet > 0 && winnerId && loserId && winnerId !== loserId) {
-      try {
-        const batch = db.batch();
-        // Verifica saldo do perdedor
-        const loserSnap = await db.collection('users').doc(loserId).get();
-        const loserChips = loserSnap.exists ? (loserSnap.data().chips || 0) : 0;
-        const debit = Math.min(bet, loserChips); // nunca vai negativo
-
-        if (debit > 0) {
-          batch.update(db.collection('users').doc(loserId), {
-            chips: admin.firestore.FieldValue.increment(-debit),
-          });
-          batch.update(db.collection('users').doc(winnerId), {
-            chips: admin.firestore.FieldValue.increment(debit),
-          });
-          await batch.commit();
-          await logTransaction(winnerId, 'win',  debit, `Vitória em ${room.game}`);
-          await logTransaction(loserId,  'loss', -debit, `Derrota em ${room.game}`);
-        }
-
-        // Notifica resultado com saldos atualizados
-        const [wSnap, lSnap] = await Promise.all([
-          db.collection('users').doc(winnerId).get(),
-          db.collection('users').doc(loserId).get(),
-        ]);
-        io.to(roomId).emit('game_result', {
-          winnerId, loserId, prize: debit,
-          winnerChips: wSnap.data()?.chips || 0,
-          loserChips:  lSnap.data()?.chips || 0,
-        });
-      } catch(e) {
-        console.error('Erro ao processar resultado:', e);
-        io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
-      }
-    } else {
+      // Sem debito/credito aqui — as 5 fichas de entrada ja foram cobradas ao entrar na sala
+      // Apenas notifica o resultado
       io.to(roomId).emit('game_result', { winnerId, loserId, prize: 0 });
-    }
 
-    // Incrementa vitórias do vencedor na sala
-    if(winnerId) {
-      const wp = room.players.find(p=>p.uid===winnerId);
-      if(wp) { wp.score = (wp.score||0)+1; }
-    }
-    if (room.matchId) {
-      await db.collection('matches').doc(room.matchId).update({
-        status: 'finished', winnerId, loserId,
-        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }).catch(()=>{});
-    }
-
-    rooms.delete(roomId);
-    io.to('lobby').emit('rooms_update', getRoomsList());
+      if(winnerId) {
+        const wp = room.players.find(p=>p.uid===winnerId);
+        if(wp) wp.score = (wp.score||0)+1;
+      }
+      if (room.matchId) {
+        await db.collection('matches').doc(room.matchId).update({
+          status: 'finished', winnerId, loserId,
+          finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(()=>{});
+      }
+      rooms.delete(roomId);
+      io.to('lobby').emit('rooms_update', getRoomsList());
+    } catch(e) { console.error('game_over erro:', e.message); }
   });
-
   // ── Atualiza lista de salas sob demanda ──────────────────
   socket.on('get_rooms', () => {
     socket.emit('rooms_update', getRoomsList());
