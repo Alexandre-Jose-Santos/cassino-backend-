@@ -742,16 +742,22 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
-    // Verificar saldo minimo (sem debitar — deducao ocorre no resultado de cada mao)
-    const entryCost = room.game === 'poker' ? 5 : (room.betAmount || 0);
-    if(entryCost > 0) {
-      for(const p of room.players) {
-        const snap = await db.collection('users').doc(p.uid).get();
-        const chips = snap.exists ? (snap.data().chips||0) : 0;
-        if(chips < entryCost) { io.to(room.id||roomId).emit('error',{message:`${p.name} tem apenas ${chips} fichas. Minimo: ${entryCost}.`}); return; }
+    // Cobrar 5 fichas de entrada de cada jogador (taxa de entrada na sala)
+    const ENTRY_FEE = 5;
+    for(const p of room.players) {
+      const snap = await db.collection('users').doc(p.uid).get();
+      const chips = snap.exists ? (snap.data().chips||0) : 0;
+      if(chips < ENTRY_FEE) {
+        io.to(room.id||roomId).emit('error',{message:`${p.name} nao tem fichas suficientes. Minimo: ${ENTRY_FEE}.`});
+        return;
       }
-      // Sem deducao aqui — fichas sao debitadas/creditadas apenas no resultado de cada mao
     }
+    for(const p of room.players) {
+      await db.collection('users').doc(p.uid).update({
+        chips: admin.firestore.FieldValue.increment(-ENTRY_FEE)
+      }).catch(()=>{});
+    }
+    console.log('💰 5 fichas cobradas de cada jogador na sala', roomId);
     if(room.game==='poker') room.pokerBetVotes={};
     room.status = 'playing';
     const matchRef = await db.collection('matches').add({
