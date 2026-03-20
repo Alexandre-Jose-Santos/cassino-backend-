@@ -621,13 +621,13 @@ io.on('connection', socket => {
 
   // ── Criar sala ──────────────────────────────────────────
   socket.on('create_room', async ({ game, betAmount, maxPlayers=4 }) => {
-    // Valida maxPlayers
+    try {
     const max = Math.min(Math.max(parseInt(maxPlayers)||2, 2), 4);
     const snap = await db.collection('users').doc(uid).get();
-    const balance = snap.data().chips;
-    const createCost = game === 'poker' ? 5 : betAmount;
-    if (balance < createCost) {
-      socket.emit('error', { message: `Saldo insuficiente! Você tem ${balance} fichas e precisa de ${createCost}.` });
+    const balance = snap.data()?.chips || 0;
+    // Minimo 5 fichas — aposta real negociada dentro do jogo
+    if (balance < 5) {
+      socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
 
@@ -642,6 +642,7 @@ io.on('connection', socket => {
     socket.join(roomId);
     socket.emit('room_created', { roomId, room: rooms.get(roomId) });
     io.to('lobby').emit('rooms_update', getRoomsList());
+    } catch(e) { console.error('create_room erro:', e.message); socket.emit('error',{message:'Erro ao criar sala.'}); }
   });
 
   // ── Entrar em sala ──────────────────────────────────────
@@ -690,9 +691,9 @@ io.on('connection', socket => {
     // Verifica saldo antes de entrar
     const joinSnap = await db.collection('users').doc(uid).get();
     const joinBalance = joinSnap.exists ? (joinSnap.data().chips || 0) : 0;
-    const joinCost = room.game === 'poker' ? 5 : room.betAmount;
-    if (joinBalance < joinCost) {
-      socket.emit('error', { message: `Saldo insuficiente! Você tem ${joinBalance} fichas e precisa de ${joinCost}.` });
+    // Minimo 5 fichas para entrar — aposta real negociada dentro do jogo
+    if (joinBalance < 5) {
+      socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
 
@@ -741,16 +742,15 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Nem todos estão prontos.' });
       return;
     }
+    // Verificar saldo minimo (sem debitar — deducao ocorre no resultado de cada mao)
     const entryCost = room.game === 'poker' ? 5 : (room.betAmount || 0);
     if(entryCost > 0) {
       for(const p of room.players) {
         const snap = await db.collection('users').doc(p.uid).get();
         const chips = snap.exists ? (snap.data().chips||0) : 0;
-        if(chips < entryCost) { io.to(room.id||roomId).emit('error',{message:`${p.name} tem apenas ${chips} fichas. Mínimo: ${entryCost}.`}); return; }
+        if(chips < entryCost) { io.to(room.id||roomId).emit('error',{message:`${p.name} tem apenas ${chips} fichas. Minimo: ${entryCost}.`}); return; }
       }
-      for(const p of room.players) {
-        await db.collection('users').doc(p.uid).update({chips:admin.firestore.FieldValue.increment(-entryCost)}).catch(()=>{});
-      }
+      // Sem deducao aqui — fichas sao debitadas/creditadas apenas no resultado de cada mao
     }
     if(room.game==='poker') room.pokerBetVotes={};
     room.status = 'playing';
@@ -899,19 +899,19 @@ io.on('connection', socket => {
         ps.checkedUids.add(uid);
         if(ps.checkedUids.size >= 2) { advancePokerStage(room, roomId, io); return; }
         ps.currentTurn = oppUid;
-        const oppSockC = findSock(oppUid);
-        // Envia para o adversário: é a vez dele agir (check do oponente)
-        if(oppSockC) oppSockC.emit('game_action',{uid:oppUid, action:'poker_action', data:{
-          action:'check', uid, pot:ps.pot, myTurn:true, curBet:0,
-          myChips:ps.chips[oppUid]||0, myBet:ps.bets[oppUid]||0,
-          oppChips:ps.chips[uid]||0, oppBet:ps.bets[uid]||0,
-        }});
-        // Confirma para quem checkeu: aguarda adversário
-        const mySockC = findSock(uid);
-        if(mySockC) mySockC.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'checked', uid, pot:ps.pot, myTurn:false, curBet:0,
-          myChips:ps.chips[uid]||0, myBet:ps.bets[uid]||0,
-        }});
+        // Notifica ambos usando uid:'server' — frontend usa data.myTurn como fonte de verdade
+        for(const p of room.players) {
+          const pSockC = findSock(p.uid);
+          const isMe = p.uid === uid;
+          const oppU = room.players.find(op=>op.uid!==p.uid)?.uid;
+          if(pSockC) pSockC.emit('game_action',{uid:'server', action:'poker_action', data:{
+            action: isMe ? 'checked' : 'check',
+            whoActed: uid,
+            pot: ps.pot, myTurn: !isMe, curBet: 0,
+            myChips: ps.chips[p.uid]||0, myBet: ps.bets[p.uid]||0,
+            oppChips: ps.chips[oppU]||0, oppBet: ps.bets[oppU]||0,
+          }});
+        }
         return;
       }
 
@@ -921,16 +921,18 @@ io.on('connection', socket => {
         ps.bets[uid] = myBetNow + toCall;
         ps.pot += toCall;
         ps.checkedUids = new Set();
-        const mySockK = findSock(uid);
-        if(mySockK) mySockK.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'called', uid, pot:ps.pot, myTurn:false,
-          myChips:ps.chips[uid], myBet:ps.bets[uid],
-        }});
-        const oppSockK = findSock(oppUid);
-        if(oppSockK) oppSockK.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'call', uid, pot:ps.pot, myTurn:false,
-          oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet,
-        }});
+        for(const p of room.players) {
+          const pSockK = findSock(p.uid);
+          const isMe = p.uid === uid;
+          const oppU = room.players.find(op=>op.uid!==p.uid)?.uid;
+          if(pSockK) pSockK.emit('game_action',{uid:'server', action:'poker_action', data:{
+            action: isMe ? 'called' : 'call',
+            whoActed: uid,
+            pot: ps.pot, myTurn: false, curBet: ps.curBet,
+            myChips: ps.chips[p.uid]||0, myBet: ps.bets[p.uid]||0,
+            oppChips: ps.chips[oppU]||0, oppBet: ps.bets[oppU]||0,
+          }});
+        }
         setTimeout(() => advancePokerStage(room, roomId, io), 600);
         return;
       }
@@ -947,17 +949,18 @@ io.on('connection', socket => {
         ps.curBet = ps.bets[uid];
         ps.checkedUids = new Set();
         ps.currentTurn = oppUid;
-        const mySockB = findSock(uid);
-        if(mySockB) mySockB.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'bet_done', uid, pot:ps.pot, myTurn:false,
-          myChips:ps.chips[uid], myBet:ps.bets[uid], curBet:ps.curBet,
-        }});
-        const oppSockB = findSock(oppUid);
-        if(oppSockB) oppSockB.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'bet', uid, pot:ps.pot, myTurn:true,
-          myChips:ps.chips[oppUid]||0, myBet:ps.bets[oppUid]||0,
-          oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet,
-        }});
+        for(const p of room.players) {
+          const pSockB = findSock(p.uid);
+          const isMe = p.uid === uid;
+          const oppU = room.players.find(op=>op.uid!==p.uid)?.uid;
+          if(pSockB) pSockB.emit('game_action',{uid:'server', action:'poker_action', data:{
+            action: isMe ? 'bet_done' : 'bet',
+            whoActed: uid,
+            pot: ps.pot, myTurn: !isMe, curBet: ps.curBet,
+            myChips: ps.chips[p.uid]||0, myBet: ps.bets[p.uid]||0,
+            oppChips: ps.chips[oppU]||0, oppBet: ps.bets[oppU]||0,
+          }});
+        }
         return;
       }
 
@@ -972,17 +975,18 @@ io.on('connection', socket => {
         ps.curBet = ps.bets[uid];
         ps.checkedUids = new Set();
         ps.currentTurn = oppUid;
-        const mySockR = findSock(uid);
-        if(mySockR) mySockR.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'raised', uid, pot:ps.pot, myTurn:false,
-          myChips:ps.chips[uid], myBet:ps.bets[uid], curBet:ps.curBet,
-        }});
-        const oppSockR = findSock(oppUid);
-        if(oppSockR) oppSockR.emit('game_action',{uid:uid, action:'poker_action', data:{
-          action:'raise', uid, pot:ps.pot, myTurn:true,
-          myChips:ps.chips[oppUid]||0, myBet:ps.bets[oppUid]||0,
-          oppChips:ps.chips[uid], oppBet:ps.bets[uid], curBet:ps.curBet, raiseAmt:ps.curBet,
-        }});
+        for(const p of room.players) {
+          const pSockR = findSock(p.uid);
+          const isMe = p.uid === uid;
+          const oppU = room.players.find(op=>op.uid!==p.uid)?.uid;
+          if(pSockR) pSockR.emit('game_action',{uid:'server', action:'poker_action', data:{
+            action: isMe ? 'raised' : 'raise',
+            whoActed: uid,
+            pot: ps.pot, myTurn: !isMe, curBet: ps.curBet,
+            myChips: ps.chips[p.uid]||0, myBet: ps.bets[p.uid]||0,
+            oppChips: ps.chips[oppU]||0, oppBet: ps.bets[oppU]||0,
+          }});
+        }
         return;
       }
       return;
