@@ -596,6 +596,8 @@ function doPokerShowdown(room, roomId, io) {
       oppChips: ps.chips[oppUid]||0,
       oppHand: ps.hands[oppUid],
       myHand: {score:p.uid===p0?h0.score:h1.score},
+      myHandName: p.uid===p0?h0.name:h1.name,
+      oppHandName: p.uid===p0?h1.name:h0.name,
       reason: tie?'Empate!':(p.uid===winnerId?`${p.uid===p0?h0.name:h1.name} bate ${p.uid===p0?h1.name:h0.name}`:
         `${p.uid===p0?h1.name:h0.name} bate ${p.uid===p0?h0.name:h1.name}`)
     }});
