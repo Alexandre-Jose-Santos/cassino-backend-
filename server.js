@@ -17,7 +17,7 @@ const serviceAccount = JSON.parse(
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-});
+
 const db = admin.firestore();
 
 // ── Express + CORS ───────────────────────────────────────────
