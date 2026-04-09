@@ -591,7 +591,9 @@ function doPokerShowdown(room, roomId, io) {
     const oppUid = room.players.find(op=>op.uid!==p.uid)?.uid;
     if(pSock) pSock.emit('game_action',{uid:'server',action:'poker_win',data:{
       winnerId: tie?null:winnerId,
+      loserId: tie?null:loserId,
       tie,
+      prize: tie ? Math.floor(ps.pot/2) : (p.uid===winnerId ? ps.pot : 0),
       myChips: ps.chips[p.uid]||0,
       oppChips: ps.chips[oppUid]||0,
       oppHand: ps.hands[oppUid],
@@ -874,11 +876,11 @@ io.on('connection', socket => {
 
       if(playerAction === 'fold') {
         const winnerId = oppUid;
+        const prize = ps.pot;
         ps.chips[winnerId] = (ps.chips[winnerId]||0) + ps.pot;
         io.to(roomId).emit('game_action',{uid:'server', action:'poker_fold', data:{
-          winnerId, myChips: ps.chips[uid]||0, oppChips: ps.chips[winnerId], pot: 0
+          winnerId, loserId: uid, prize, myChips: ps.chips[uid]||0, oppChips: ps.chips[winnerId], pot: 0
         }});
-        const prize = ps.pot;
         io.to(roomId).emit('game_result',{winnerId, loserId:uid, prize,
           winnerChips: ps.chips[winnerId], loserChips: ps.chips[uid]||0});
         // Fichas do pote sao in-memory apenas — sem debito/credito no Firestore aqui
