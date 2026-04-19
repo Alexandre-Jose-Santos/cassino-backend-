@@ -630,11 +630,7 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
-    // Debita 5 fichas de entrada ao criar a sala
-    await db.collection('users').doc(uid).update({
-      chips: admin.firestore.FieldValue.increment(-5)
-    }).catch(()=>{});
-
+    // Cria a sala PRIMEIRO, debita fichas SÓ se tudo der certo
     const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
     rooms.set(roomId, {
       id: roomId, game, betAmount, maxPlayers: max,
@@ -644,6 +640,20 @@ io.on('connection', socket => {
     });
 
     socket.join(roomId);
+
+    // Debita 5 fichas SOMENTE após confirmar que a sala foi criada com sucesso
+    try {
+      await db.collection('users').doc(uid).update({
+        chips: admin.firestore.FieldValue.increment(-5)
+      });
+    } catch(e) {
+      // Se falhar o débito, remove a sala e avisa
+      rooms.delete(roomId);
+      socket.leave(roomId);
+      socket.emit('error', { message: 'Erro ao debitar fichas. Sala cancelada.' });
+      return;
+    }
+
     socket.emit('room_created', { roomId, room: rooms.get(roomId) });
     io.to('lobby').emit('rooms_update', getRoomsList());
     } catch(e) { console.error('create_room erro:', e.message); socket.emit('error',{message:'Erro ao criar sala.'}); }
@@ -700,13 +710,23 @@ io.on('connection', socket => {
       socket.emit('error', { message: 'Saldo insuficiente! Voce precisa de pelo menos 5 fichas.' });
       return;
     }
-    // Debita 5 fichas de entrada ao entrar na sala
-    await db.collection('users').doc(uid).update({
-      chips: admin.firestore.FieldValue.increment(-5)
-    }).catch(()=>{});
-
+    // Adiciona jogador à sala PRIMEIRO
     room.players.push({ uid, name: user.name, avatar: user.avatar, ready: false, online: true });
     socket.join(roomId);
+
+    // Debita 5 fichas SOMENTE após confirmar entrada com sucesso
+    try {
+      await db.collection('users').doc(uid).update({
+        chips: admin.firestore.FieldValue.increment(-5)
+      });
+    } catch(e) {
+      // Se falhar débito, remove jogador da sala
+      room.players = room.players.filter(p => p.uid !== uid);
+      socket.leave(roomId);
+      socket.emit('error', { message: 'Erro ao debitar fichas. Entrada cancelada.' });
+      return;
+    }
+
     // Confirma entrada para quem entrou
     socket.emit('room_joined', { room });
     // Avisa todos na sala
