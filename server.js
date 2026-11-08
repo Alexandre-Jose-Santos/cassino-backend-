@@ -12,13 +12,20 @@ const crypto     = require('crypto');
 require('dotenv').config();
 
 // ── Firebase Admin Init ──────────────────────────────────────
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId:     process.env.FIREBASE_PROJECT_ID,
-    clientEmail:   process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey:    process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  }),
-});
+// Opção simples: FIREBASE_SERVICE_ACCOUNT = conteúdo inteiro do arquivo .json da chave.
+// Opção antiga (ainda aceita): FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.
+let fbCred;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  fbCred = { projectId: sa.project_id, clientEmail: sa.client_email, privateKey: sa.private_key };
+} else {
+  fbCred = {
+    projectId:   process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  };
+}
+admin.initializeApp({ credential: admin.credential.cert(fbCred) });
 const db = admin.firestore();
 
 // ── Express + CORS ───────────────────────────────────────────
@@ -164,38 +171,112 @@ app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 //  DOAÇÕES — MURAL DE APOIADORES
-//  Doação é feita por Pix direto (fora do jogo). O jogador pode registrar
-//  nome/apelido opcional; só aparece no mural depois que o dono confirma.
+//  Pix gerado pelo Asaas; o webhook confirma o pagamento e o doador aparece
+//  no mural automaticamente (nome opcional). Admin pode confirmar manualmente.
 // ════════════════════════════════════════════════════════════
 const cleanTxt = (v, max) => String(v ?? '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
 let donCache = { at: 0, data: null };
 
-// Jogador registra uma doação (fica pendente até confirmação)
-app.post('/api/donations/intent', authMiddleware, async (req, res) => {
+// ── Asaas (Pix) ───────────────────────────────────────────────
+// Env: ASAAS_API_KEY, ASAAS_PIX_KEY (chave Pix aleatória da conta Asaas),
+//      ASAAS_WEBHOOK_TOKEN (32+ caracteres), ASAAS_ENV ('production' ou sandbox por padrão)
+const ASAAS_BASE = process.env.ASAAS_ENV === 'production' ? 'https://api.asaas.com/v3' : 'https://api-sandbox.asaas.com/v3';
+const asaasOK = () => !!(process.env.ASAAS_API_KEY && process.env.ASAAS_PIX_KEY);
+async function asaasCall(path, method = 'GET', body) {
+  const r = await fetch(ASAAS_BASE + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'access_token': process.env.ASAAS_API_KEY, 'User-Agent': 'AR-Cassino' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('Asaas ' + r.status + ': ' + JSON.stringify(j.errors || j).slice(0, 200));
+  return j;
+}
+
+// Jogador gera o Pix da doação (QR Code estático do Asaas, valor fixo).
+// Nome é opcional: em branco = aparece como "Anônimo".
+app.post('/api/donations/pix', authMiddleware, async (req, res) => {
+  if (!asaasOK()) return res.status(503).json({ error: 'Doação por Pix ainda não está configurada' });
+  let ref = null;
   try {
-    const displayName = cleanTxt(req.body.displayName, 30);
-    const message     = cleanTxt(req.body.message, 80);
+    const nameIn      = cleanTxt(req.body.displayName, 30);
+    const displayName = nameIn || 'Anônimo';
+    const message     = nameIn ? cleanTxt(req.body.message, 80) : '';
     const amount      = Math.round(Number(req.body.amount) * 100) / 100;
     const showAmount  = !!req.body.showAmount;
-    if (!displayName) return res.status(400).json({ error: 'Informe um nome ou apelido' });
-    if (!(amount >= 1 && amount <= 10000)) return res.status(400).json({ error: 'Valor inválido' });
+    if (!(amount >= 1 && amount <= 10000)) return res.status(400).json({ error: 'Valor inválido (mínimo R$ 1)' });
 
-    // Limite: 3 registros por dia por usuário (evita spam)
-    const mine = await db.collection('donations').where('userId', '==', req.user.uid).limit(30).get();
+    // Limite: 10 Pix gerados por dia por usuário (evita spam)
+    const mine = await db.collection('donations').where('userId', '==', req.user.uid).limit(50).get();
     const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-    if (mine.docs.filter(d => (d.data().createdAt?.toMillis?.() || 0) > dayAgo).length >= 3)
-      return res.status(429).json({ error: 'Muitos registros hoje. Tente amanhã.' });
+    if (mine.docs.filter(d => (d.data().createdAt?.toMillis?.() || 0) > dayAgo).length >= 10)
+      return res.status(429).json({ error: 'Muitos Pix gerados hoje. Tente amanhã.' });
 
     const code = 'AR-' + crypto.randomInt(1000, 10000);
-    const ref = await db.collection('donations').add({
+    ref = await db.collection('donations').add({
       userId: req.user.uid, displayName, message, amount, showAmount, code,
-      status: 'pending',
+      status: 'pending', source: 'asaas',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    res.json({ success: true, id: ref.id, code });
+
+    // expira em 24h (horário de Brasília)
+    const exp = new Date(Date.now() - 3 * 3600 * 1000 + 24 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    const qr = await asaasCall('/pix/qrCodes/static', 'POST', {
+      addressKey: process.env.ASAAS_PIX_KEY,
+      description: 'Doação Cassino AR ' + code,
+      value: amount, format: 'ALL', expirationDate: exp,
+    });
+    await ref.update({ asaasQrId: qr.id });
+    res.json({ id: ref.id, code, payload: qr.payload, encodedImage: qr.encodedImage });
   } catch (e) {
-    console.error('donation intent erro:', e.message);
-    res.status(500).json({ error: 'Erro ao registrar' });
+    console.error('donation pix erro:', e.message);
+    if (ref) ref.delete().catch(() => {});
+    res.status(502).json({ error: 'Não foi possível gerar o Pix agora. Tente de novo.' });
+  }
+});
+
+// Status da doação (só o próprio doador consulta) — usado para detectar o pagamento na tela
+app.get('/api/donations/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const snap = await db.collection('donations').doc(req.params.id).get();
+    if (!snap.exists || snap.data().userId !== req.user.uid) return res.status(404).json({ error: 'Não encontrado' });
+    res.json({ status: snap.data().status });
+  } catch (e) { res.status(500).json({ error: 'Erro' }); }
+});
+
+// Confirma a doação a partir do evento de pagamento do Asaas (idempotente)
+async function confirmDonationFromAsaas(pay) {
+  const dup = await db.collection('donations').where('asaasPaymentId', '==', pay.id).limit(1).get();
+  if (!dup.empty) return;                                   // evento repetido
+  const snap = await db.collection('donations').where('asaasQrId', '==', pay.pixQrCodeId).limit(1).get();
+  if (snap.empty) { console.log('Pix recebido sem doação associada:', pay.id); return; }
+  const doc = snap.docs[0], d = doc.data();
+  const value = Math.round(Number(pay.value) * 100) / 100;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  if (d.status === 'pending' || (d.status === 'confirmed' && !d.asaasPaymentId)) {
+    await doc.ref.update({ status: 'confirmed', amount: value, asaasPaymentId: pay.id, confirmedAt: d.confirmedAt || now });
+  } else {                                                  // mesmo QR pago de novo → nova doação confirmada
+    await db.collection('donations').add({ ...d, amount: value, asaasPaymentId: pay.id, status: 'confirmed', createdAt: now, confirmedAt: now });
+  }
+  donCache.at = 0;
+  console.log(`💖 Doação confirmada: ${d.displayName} R$ ${value}`);
+}
+
+// Webhook do Asaas (configure em Integrações > Webhooks, evento PAYMENT_RECEIVED)
+app.post('/api/webhooks/asaas', async (req, res) => {
+  const tok = process.env.ASAAS_WEBHOOK_TOKEN || '';
+  const got = String(req.get('asaas-access-token') || '');
+  const A = Buffer.from(tok), B = Buffer.from(got);
+  if (!tok || A.length !== B.length || !crypto.timingSafeEqual(A, B)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const ev = req.body?.event, pay = req.body?.payment;
+    if ((ev === 'PAYMENT_RECEIVED' || ev === 'PAYMENT_CONFIRMED') && pay?.pixQrCodeId && pay?.id) {
+      await confirmDonationFromAsaas(pay);
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error('webhook asaas erro:', e.message);
+    res.status(500).json({ error: 'erro' });
   }
 });
 
