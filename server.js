@@ -1,6 +1,7 @@
 // ============================================================
 //  CASSIANO CASINO — BACKEND COMPLETO
-//  Node.js + Express + Socket.io + Firebase Admin + Mercado Pago
+//  Node.js + Express + Socket.io + Firebase Admin
+//  Versão gratuita: fichas virtuais, sem valor real, sem compra e sem saque
 // ============================================================
 const express    = require('express');
 const http       = require('http');
@@ -30,11 +31,13 @@ const io = new Server(server, {
   transports: ['websocket', 'polling'],
 });
 
-// Keep-alive: evita que o Railway adormeça (free tier dorme após inatividade)
+// Keep-alive para o Render (plano grátis dorme após ~15 min sem acesso).
+// O Render define RENDER_EXTERNAL_URL automaticamente. Para ficar 100% sempre ligado,
+// use também um pinger externo (ex.: UptimeRobot) apontando para /health.
 setInterval(() => {
-  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!domain) return;
-  require('https').get(`https://${domain}/health`, r => {
+  const url = process.env.RENDER_EXTERNAL_URL;
+  if (!url) return;
+  require('https').get(`${url}/health`, r => {
     console.log(`💓 Keep-alive: ${r.statusCode} | salas: ${rooms.size} | conexões: ${io.sockets.sockets.size}`);
   }).on('error', e => console.warn('Keep-alive falhou:', e.message));
 }, 3 * 60 * 1000); // a cada 3 minutos
@@ -48,24 +51,10 @@ app.get('/wake', (req, res) => {
 });
 app.use(express.json());
 
-// ── Mercado Pago Config ──────────────────────────────────────
-// MODO SANDBOX ATÉ TER CNPJ/LICENÇA — troca ACCESS_TOKEN por produção depois
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN; // sandbox token por agora
-
-// ── Pacotes de Fichas ─────────────────────────────────────────
-// 1 ficha = R$0,10 (10 fichas = R$1,00)
-const CHIP_RATE = 0.10;
-const PACKAGES = [
-  { id: 'pkg_1',  label: 'Iniciante', price: 1.00,  chips: 10,   bonus: 0 },
-  { id: 'pkg_2',  label: 'Bronze',    price: 2.00,  chips: 20,   bonus: 0 },
-  { id: 'pkg_3',  label: 'Prata',     price: 5.00,  chips: 50,   bonus: 0 },
-  { id: 'pkg_4',  label: 'Ouro',      price: 10.00, chips: 100,  bonus: 0 },
-  { id: 'pkg_5',  label: 'Platina',   price: 20.00, chips: 200,  bonus: 0 },
-  { id: 'pkg_6',  label: 'Diamante',  price: 50.00, chips: 500,  bonus: 0 },
-  { id: 'pkg_7',  label: 'Elite',     price: 100.00,chips: 1000, bonus: 0 },
-];
-
-const SAQUE_TAXA = 0.10; // 10% de taxa sobre saques
+// ── Fichas virtuais ──────────────────────────────────────────
+// Fichas NÃO têm valor em dinheiro: não podem ser compradas nem sacadas.
+const BONUS_FICHAS = 50;                    // fichas grátis por resgate
+const BONUS_COOLDOWN_MS = 12*60*60*1000;    // a cada 12 horas
 
 // ════════════════════════════════════════════════════════════
 //  ROTAS DE AUTENTICAÇÃO
@@ -95,8 +84,6 @@ app.post('/api/auth/profile', authMiddleware, async (req, res) => {
       name: name || email.split('@')[0],
       avatar: picture || '',
       chips: 150,          // bônus de boas-vindas
-      totalDeposited: 0,
-      totalWithdrawn: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       status: 'active',
     });
@@ -109,178 +96,14 @@ app.post('/api/auth/profile', authMiddleware, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  ROTAS DE PAGAMENTO — MERCADO PAGO PIX
-// ════════════════════════════════════════════════════════════
-
-// Gera cobrança PIX
-app.post('/api/payment/create', authMiddleware, async (req, res) => {
-  const { packageId } = req.body;
-  const pkg = PACKAGES.find(p => p.id === packageId);
-  if (!pkg) return res.status(400).json({ error: 'Pacote inválido' });
-
-  const { uid, email, name } = req.user;
-  const idempotencyKey = crypto.randomUUID();
-
-  try {
-    const response = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type':       'application/json',
-        'Authorization':      `Bearer ${MP_TOKEN}`,
-        'X-Idempotency-Key':  idempotencyKey,
-      },
-      body: JSON.stringify({
-        transaction_amount: pkg.price,
-        description: `Cassino AR — ${pkg.label} (${pkg.chips + pkg.bonus} fichas)`,
-        payment_method_id: 'pix',
-        payer: { email, first_name: name || 'Jogador' },
-        notification_url: `${process.env.BACKEND_URL}/api/payment/webhook`,
-        metadata: {
-          user_id:    uid,
-          package_id: packageId,
-          chips:      pkg.chips + pkg.bonus,
-        },
-      }),
-    });
-
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.message || 'Erro Mercado Pago');
-
-    // Salva pagamento pendente no Firestore
-    await db.collection('payments').doc(String(data.id)).set({
-      paymentId:  data.id,
-      userId:     uid,
-      packageId,
-      price:      pkg.price,
-      chips:      pkg.chips + pkg.bonus,
-      status:     'pending',
-      createdAt:  admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({
-      success: true,
-      paymentId: data.id,
-      qrCode:    data.point_of_interaction?.transaction_data?.qr_code,
-      qrCodeB64: data.point_of_interaction?.transaction_data?.qr_code_base64,
-      pixKey:    data.point_of_interaction?.transaction_data?.qr_code,
-    });
-
-  } catch (err) {
-    console.error('Erro ao criar pagamento:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Webhook Mercado Pago — confirma pagamento
-app.post('/api/payment/webhook', async (req, res) => {
-  res.sendStatus(200); // responde rápido pro MP
-
-  const { action, data } = req.body;
-  if (action !== 'payment.updated') return;
-
-  try {
-    const response = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
-      headers: { 'Authorization': `Bearer ${MP_TOKEN}` }
-    });
-    const payment = await response.json();
-    if (payment.status !== 'approved') return;
-
-    const payRef = db.collection('payments').doc(String(data.id));
-    const paySnap = await payRef.get();
-    if (!paySnap.exists) return;
-
-    const pay = paySnap.data();
-    if (pay.status === 'approved') return; // já processado
-
-    // Credita fichas
-    await db.collection('users').doc(pay.userId).update({
-      chips:          admin.firestore.FieldValue.increment(pay.chips),
-      totalDeposited: admin.firestore.FieldValue.increment(pay.price),
-    });
-
-    await payRef.update({ status: 'approved', approvedAt: admin.firestore.FieldValue.serverTimestamp() });
-    await logTransaction(pay.userId, 'deposit', pay.chips, `Compra via PIX — R$${pay.price} (${pay.chips} fichas)`);
-
-    // Notifica cliente em tempo real via Socket.io
-    const userSockets = [...io.sockets.sockets.values()]
-      .filter(s => s.data.uid === pay.userId);
-    userSockets.forEach(s => s.emit('chips_credited', {
-      chips:   pay.chips,
-      message: `✅ PIX confirmado! +${pay.chips.toLocaleString()} fichas creditadas!`,
-    }));
-
-  } catch (err) {
-    console.error('Erro no webhook:', err);
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-//  ROTAS DE SAQUE
-//  🔒 BLOQUEADO ATÉ OBTER LICENÇA — código pronto para ativar
-// ════════════════════════════════════════════════════════════
-
-app.post('/api/withdrawal/request', authMiddleware, async (req, res) => {
-  // REMOVA ESTE BLOCO QUANDO TIVER LICENÇA:
-  if (process.env.WITHDRAWALS_ENABLED !== 'true') {
-    return res.status(403).json({
-      error: 'Saques temporariamente indisponíveis. Em breve!',
-      locked: true,
-    });
-  }
-
-  const { chips, pixKey } = req.body;
-  if (!chips || chips < 100) return res.status(400).json({ error: 'Mínimo de 100 fichas (R$10,00) para saque' });
-  if (!pixKey) return res.status(400).json({ error: 'Chave PIX obrigatória' });
-
-  const { uid } = req.user;
-  const userRef = db.collection('users').doc(uid);
-  const userSnap = await userRef.get();
-  const user = userSnap.data();
-
-  if (user.chips < chips) return res.status(400).json({ error: 'Saldo insuficiente' });
-
-  const grossValue = parseFloat((chips * 0.10).toFixed(2)); // 1 ficha = R$0,10
-  const fee        = grossValue * SAQUE_TAXA;
-  const netValue   = parseFloat((grossValue - fee).toFixed(2));
-
-  // Deduz fichas e cria pedido de saque
-  await userRef.update({
-    chips: admin.firestore.FieldValue.increment(-chips),
-  });
-
-  const withdrawalRef = await db.collection('withdrawals').add({
-    userId:     uid,
-    userName:   user.name,
-    userEmail:  user.email,
-    chips,
-    grossValue,
-    fee,
-    netValue,
-    pixKey,
-    status:     'pending',   // admin aprova manualmente
-    createdAt:  admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  await logTransaction(uid, 'withdrawal_request', -chips, `Pedido de saque R$${netValue} (taxa 10%)`);
-
-  res.json({
-    success: true,
-    withdrawalId: withdrawalRef.id,
-    netValue,
-    fee,
-    message: `Pedido registrado! Você receberá R$${netValue} em até 24h.`,
-  });
-});
-
-// ════════════════════════════════════════════════════════════
 //  ROTAS DO USUÁRIO
 // ════════════════════════════════════════════════════════════
 
 app.get('/api/user/balance', authMiddleware, async (req, res) => {
   const snap = await db.collection('users').doc(req.user.uid).get();
   if (!snap.exists) return res.status(404).json({ error: 'Usuário não encontrado' });
-  const { chips, totalDeposited, totalWithdrawn } = snap.data();
-  res.json({ chips, totalDeposited, totalWithdrawn });
+  const { chips, lastBonusAt } = snap.data();
+  res.json({ chips, lastBonusAt: lastBonusAt?.toMillis?.() || 0 });
 });
 
 app.get('/api/user/transactions', authMiddleware, async (req, res) => {
@@ -290,6 +113,30 @@ app.get('/api/user/transactions', authMiddleware, async (req, res) => {
     .limit(50)
     .get();
   res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+});
+
+// Resgata fichas grátis (a cada 12h)
+app.post('/api/user/bonus', authMiddleware, async (req, res) => {
+  const ref = db.collection('users').doc(req.user.uid);
+  try {
+    const out = await db.runTransaction(async tx => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { status: 404, body: { error: 'Usuário não encontrado' } };
+      const last = snap.data().lastBonusAt?.toMillis?.() || 0;
+      const wait = last + BONUS_COOLDOWN_MS - Date.now();
+      if (wait > 0) return { status: 429, body: { error: 'Ainda não disponível', waitMs: wait } };
+      tx.update(ref, {
+        chips: admin.firestore.FieldValue.increment(BONUS_FICHAS),
+        lastBonusAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { status: 200, body: { success: true, chips: BONUS_FICHAS } };
+    });
+    if (out.status === 200) await logTransaction(req.user.uid, 'bonus', BONUS_FICHAS, 'Fichas grátis');
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error('bonus erro:', e.message);
+    res.status(500).json({ error: 'Erro ao resgatar fichas' });
+  }
 });
 
 // ════════════════════════════════════════════════════════════
@@ -309,67 +156,116 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
   res.json(snap.docs.map(d => d.data()));
 });
 
-// Lista saques pendentes
-app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
-  const snap = await db.collection('withdrawals')
-    .where('status', '==', 'pending')
-    .orderBy('createdAt', 'asc')
-    .get();
+// Dashboard simples
+app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
+  const usersSnap = await db.collection('users').get();
+  res.json({ totalUsers: usersSnap.size, rooms: rooms.size, connections: io.sockets.sockets.size });
+});
+
+// ════════════════════════════════════════════════════════════
+//  DOAÇÕES — MURAL DE APOIADORES
+//  Doação é feita por Pix direto (fora do jogo). O jogador pode registrar
+//  nome/apelido opcional; só aparece no mural depois que o dono confirma.
+// ════════════════════════════════════════════════════════════
+const cleanTxt = (v, max) => String(v ?? '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+let donCache = { at: 0, data: null };
+
+// Jogador registra uma doação (fica pendente até confirmação)
+app.post('/api/donations/intent', authMiddleware, async (req, res) => {
+  try {
+    const displayName = cleanTxt(req.body.displayName, 30);
+    const message     = cleanTxt(req.body.message, 80);
+    const amount      = Math.round(Number(req.body.amount) * 100) / 100;
+    const showAmount  = !!req.body.showAmount;
+    if (!displayName) return res.status(400).json({ error: 'Informe um nome ou apelido' });
+    if (!(amount >= 1 && amount <= 10000)) return res.status(400).json({ error: 'Valor inválido' });
+
+    // Limite: 3 registros por dia por usuário (evita spam)
+    const mine = await db.collection('donations').where('userId', '==', req.user.uid).limit(30).get();
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    if (mine.docs.filter(d => (d.data().createdAt?.toMillis?.() || 0) > dayAgo).length >= 3)
+      return res.status(429).json({ error: 'Muitos registros hoje. Tente amanhã.' });
+
+    const code = 'AR-' + crypto.randomInt(1000, 10000);
+    const ref = await db.collection('donations').add({
+      userId: req.user.uid, displayName, message, amount, showAmount, code,
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ success: true, id: ref.id, code });
+  } catch (e) {
+    console.error('donation intent erro:', e.message);
+    res.status(500).json({ error: 'Erro ao registrar' });
+  }
+});
+
+// Mural público: só doações confirmadas, sem dados pessoais além do nome escolhido
+app.get('/api/donations/public', async (req, res) => {
+  if (donCache.data && Date.now() - donCache.at < 60000) return res.json(donCache.data);
+  try {
+    const snap = await db.collection('donations').where('status', '==', 'confirmed').limit(500).get();
+    const list = snap.docs.map(d => d.data())
+      .sort((a, b) => (b.confirmedAt?.toMillis?.() || 0) - (a.confirmedAt?.toMillis?.() || 0));
+    const br = new Date(Date.now() - 3 * 60 * 60 * 1000);           // horário de Brasília
+    const monthKey = br.getUTCFullYear() + '-' + br.getUTCMonth();
+    const totalMes = list.reduce((sum, d) => {
+      const t = new Date((d.confirmedAt?.toMillis?.() || 0) - 3 * 60 * 60 * 1000);
+      return t.getUTCFullYear() + '-' + t.getUTCMonth() === monthKey ? sum + (d.amount || 0) : sum;
+    }, 0);
+    donCache = { at: Date.now(), data: {
+      totalMes: Math.round(totalMes * 100) / 100,
+      total: list.length,
+      apoiadores: list.slice(0, 50).map(d => ({
+        name: d.displayName, message: d.message || '',
+        amount: d.showAmount ? d.amount : null,
+      })),
+    } };
+    res.json(donCache.data);
+  } catch (e) {
+    console.error('donations public erro:', e.message);
+    res.status(500).json({ error: 'Erro ao carregar mural' });
+  }
+});
+
+// Admin: lista por status (pending | confirmed | rejected)
+app.get('/api/admin/donations', adminAuth, async (req, res) => {
+  const status = ['pending', 'confirmed', 'rejected'].includes(req.query.status) ? req.query.status : 'pending';
+  const snap = await db.collection('donations').where('status', '==', status).limit(100).get();
   res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
-// Aprova saque
-app.post('/api/admin/withdrawals/:id/approve', adminAuth, async (req, res) => {
-  const ref = db.collection('withdrawals').doc(req.params.id);
-  const snap = await ref.get();
-  if (!snap.exists) return res.status(404).json({ error: 'Não encontrado' });
-
-  await ref.update({ status: 'approved', approvedAt: admin.firestore.FieldValue.serverTimestamp() });
-  const w = snap.data();
-  await db.collection('users').doc(w.userId).update({
-    totalWithdrawn: admin.firestore.FieldValue.increment(w.netValue),
-  });
-  await logTransaction(w.userId, 'withdrawal_approved', 0, `Saque aprovado R$${w.netValue}`);
-
+// Admin: confirma (opcionalmente corrige o valor) / rejeita
+app.post('/api/admin/donations/:id/confirm', adminAuth, async (req, res) => {
+  const ref = db.collection('donations').doc(req.params.id);
+  if (!(await ref.get()).exists) return res.status(404).json({ error: 'Não encontrado' });
+  const upd = { status: 'confirmed', confirmedAt: admin.firestore.FieldValue.serverTimestamp() };
+  const v = Math.round(Number(req.body?.amount) * 100) / 100;
+  if (v >= 1 && v <= 10000) upd.amount = v;
+  await ref.update(upd);
+  donCache.at = 0;
   res.json({ success: true });
 });
-
-// Rejeita saque (devolve fichas)
-app.post('/api/admin/withdrawals/:id/reject', adminAuth, async (req, res) => {
-  const ref = db.collection('withdrawals').doc(req.params.id);
-  const snap = await ref.get();
-  if (!snap.exists) return res.status(404).json({ error: 'Não encontrado' });
-
-  const w = snap.data();
+app.post('/api/admin/donations/:id/reject', adminAuth, async (req, res) => {
+  const ref = db.collection('donations').doc(req.params.id);
+  if (!(await ref.get()).exists) return res.status(404).json({ error: 'Não encontrado' });
   await ref.update({ status: 'rejected', rejectedAt: admin.firestore.FieldValue.serverTimestamp() });
-  await db.collection('users').doc(w.userId).update({
-    chips: admin.firestore.FieldValue.increment(w.chips),
-  });
-  await logTransaction(w.userId, 'withdrawal_rejected', w.chips, 'Saque rejeitado — fichas devolvidas');
-
+  donCache.at = 0;
   res.json({ success: true });
 });
 
-// Dashboard financeiro
-app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
-  const [usersSnap, paymentsSnap, withdrawalsSnap] = await Promise.all([
-    db.collection('users').get(),
-    db.collection('payments').where('status','==','approved').get(),
-    db.collection('withdrawals').where('status','==','approved').get(),
-  ]);
-
-  const totalUsers      = usersSnap.size;
-  const totalDeposits   = paymentsSnap.docs.reduce((s,d) => s + d.data().price, 0);
-  const totalWithdrawals= withdrawalsSnap.docs.reduce((s,d) => s + d.data().netValue, 0);
-  const totalFees       = withdrawalsSnap.docs.reduce((s,d) => s + d.data().fee, 0);
-
-  res.json({
-    totalUsers,
-    totalDeposits:    totalDeposits.toFixed(2),
-    totalWithdrawals: totalWithdrawals.toFixed(2),
-    totalFees:        totalFees.toFixed(2),
-    balance:          (totalDeposits - totalWithdrawals).toFixed(2),
+// Admin: adiciona doação já confirmada (quem doou sem preencher o formulário)
+app.post('/api/admin/donations/manual', adminAuth, async (req, res) => {
+  const displayName = cleanTxt(req.body.displayName, 30);
+  const amount = Math.round(Number(req.body.amount) * 100) / 100;
+  if (!displayName || !(amount >= 1 && amount <= 10000)) return res.status(400).json({ error: 'Nome e valor obrigatórios' });
+  await db.collection('donations').add({
+    userId: null, displayName, message: cleanTxt(req.body.message, 80), amount,
+    showAmount: !!req.body.showAmount, code: 'MANUAL', status: 'confirmed',
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+  donCache.at = 0;
+  res.json({ success: true });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -1838,7 +1734,6 @@ async function logTransaction(userId, type, chips, description) {
 
 // ── Health check ─────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', rooms: rooms.size }));
-app.get('/api/packages', (_, res) => res.json(PACKAGES));
 
 // ── Start ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
