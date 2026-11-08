@@ -152,7 +152,11 @@ app.post('/api/user/bonus', authMiddleware, async (req, res) => {
 // ════════════════════════════════════════════════════════════
 
 function adminAuth(req, res, next) {
-  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET)
+  const secret = process.env.ADMIN_SECRET || '';
+  const got = String(req.headers['x-admin-secret'] || '');
+  const A = Buffer.from(secret), B = Buffer.from(got);
+  // Sem ADMIN_SECRET configurado (ou curto demais), o admin fica fechado para todos.
+  if (secret.length < 12 || A.length !== B.length || !crypto.timingSafeEqual(A, B))
     return res.status(403).json({ error: 'Acesso negado' });
   next();
 }
