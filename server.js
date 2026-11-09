@@ -210,6 +210,16 @@ app.post('/api/donations/pix', authMiddleware, async (req, res) => {
     const showAmount  = !!req.body.showAmount;
     if (!(amount >= 1 && amount <= 10000)) return res.status(400).json({ error: 'Valor inválido (mínimo R$ 1)' });
 
+    // Foto opcional (só com nome): JPEG pequeno em base64, validado aqui. Só aparece após aprovação do admin.
+    let avatar = '';
+    if (nameIn && typeof req.body.avatar === 'string' && req.body.avatar) {
+      const a = req.body.avatar;
+      if (a.length > 30000 || !/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(a)) return res.status(400).json({ error: 'Foto inválida' });
+      const buf = Buffer.from(a.split(',')[1], 'base64');
+      if (!(buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF)) return res.status(400).json({ error: 'Foto inválida' });
+      avatar = a;
+    }
+
     // Limite: 10 Pix gerados por dia por usuário (evita spam)
     const mine = await db.collection('donations').where('userId', '==', req.user.uid).limit(50).get();
     const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
@@ -218,7 +228,7 @@ app.post('/api/donations/pix', authMiddleware, async (req, res) => {
 
     const code = 'AR-' + crypto.randomInt(1000, 10000);
     ref = await db.collection('donations').add({
-      userId: req.user.uid, displayName, message, amount, showAmount, code,
+      userId: req.user.uid, displayName, message, amount, showAmount, code, avatar, avatarOk: false,
       status: 'pending', source: 'asaas',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -289,7 +299,7 @@ app.get('/api/donations/public', async (req, res) => {
   if (donCache.data && Date.now() - donCache.at < 60000) return res.json(donCache.data);
   try {
     const snap = await db.collection('donations').where('status', '==', 'confirmed').limit(500).get();
-    const list = snap.docs.map(d => d.data())
+    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       .sort((a, b) => (b.confirmedAt?.toMillis?.() || 0) - (a.confirmedAt?.toMillis?.() || 0));
     const br = new Date(Date.now() - 3 * 60 * 60 * 1000);           // horário de Brasília
     const monthKey = br.getUTCFullYear() + '-' + br.getUTCMonth();
@@ -303,6 +313,7 @@ app.get('/api/donations/public', async (req, res) => {
       apoiadores: list.slice(0, 50).map(d => ({
         name: d.displayName, message: d.message || '',
         amount: d.showAmount ? d.amount : null,
+        avatarUrl: (d.avatar && d.avatarOk) ? '/api/donations/' + d.id + '/avatar' : null,
       })),
     } };
     res.json(donCache.data);
@@ -310,6 +321,27 @@ app.get('/api/donations/public', async (req, res) => {
     console.error('donations public erro:', e.message);
     res.status(500).json({ error: 'Erro ao carregar mural' });
   }
+});
+
+// Foto do doador: pública, mas só depois de confirmada a doação E aprovada pelo admin
+app.get('/api/donations/:id/avatar', async (req, res) => {
+  try {
+    const snap = await db.collection('donations').doc(req.params.id).get();
+    const d = snap.exists ? snap.data() : null;
+    if (!d || d.status !== 'confirmed' || !d.avatar || !d.avatarOk) return res.status(404).end();
+    res.set({ 'Cache-Control': 'public, max-age=3600', 'X-Content-Type-Options': 'nosniff' })
+       .type('image/jpeg').send(Buffer.from(d.avatar.split(',')[1], 'base64'));
+  } catch (e) { res.status(404).end(); }
+});
+
+// Admin: aprova ou remove a foto de um doador
+app.post('/api/admin/donations/:id/avatar', adminAuth, async (req, res) => {
+  const ref = db.collection('donations').doc(req.params.id);
+  if (!(await ref.get()).exists) return res.status(404).json({ error: 'Não encontrado' });
+  if (req.body?.approve) await ref.update({ avatarOk: true });
+  else await ref.update({ avatar: '', avatarOk: false });
+  donCache.at = 0;
+  res.json({ success: true });
 });
 
 // Admin: lista por status (pending | confirmed | rejected)
