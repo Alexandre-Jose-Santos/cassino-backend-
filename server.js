@@ -38,6 +38,36 @@ const io = new Server(server, {
   transports: ['websocket', 'polling'],
 });
 
+// ── Proteção contra crash ────────────────────────────────────
+// Um erro não tratado derrubaria o processo (e todas as salas, que ficam em memória).
+process.on('uncaughtException',  e => console.error('uncaughtException:', e && e.stack || e));
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e && e.stack || e));
+
+// Express 4 não captura erros de handlers async: este wrapper responde 500 em vez de deixar a promise rejeitada.
+['get','post','put','delete'].forEach(m => {
+  const orig = app[m].bind(app);
+  app[m] = (path, ...hs) => {
+    if (!hs.length) return orig(path);                 // app.get('setting')
+    return orig(path, ...hs.map(h => (typeof h === 'function' && h.constructor.name === 'AsyncFunction')
+      ? (req, res, next) => h(req, res, next).catch(e => {
+          console.error('Erro em ' + req.method + ' ' + req.path + ':', e.message);
+          if (!res.headersSent) res.status(500).json({ error: 'Erro interno' });
+        })
+      : h));
+  };
+});
+
+// Sala enviada aos clientes: nunca inclui baralho/mãos nem timers (circulares e que quebram a serialização).
+const HIDDEN_ROOM_KEYS = new Set(['pokerState','pifeState','dominoState','resetTimeout','rematchTimeout','rematchCountdown','rematchPlayers']);
+function makeRoom(room) {
+  Object.defineProperty(room, 'toJSON', { enumerable: false, value() {
+    const o = {};
+    for (const k of Object.keys(this)) if (!HIDDEN_ROOM_KEYS.has(k)) o[k] = this[k];
+    return o;
+  }});
+  return room;
+}
+
 // Keep-alive para o Render (plano grátis dorme após ~15 min sem acesso).
 // O Render define RENDER_EXTERNAL_URL automaticamente. Para ficar 100% sempre ligado,
 // use também um pinger externo (ex.: UptimeRobot) apontando para /health.
@@ -169,8 +199,8 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
 
 // Dashboard simples
 app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
-  const usersSnap = await db.collection('users').get();
-  res.json({ totalUsers: usersSnap.size, rooms: rooms.size, connections: io.sockets.sockets.size });
+  const cnt = await db.collection('users').count().get();
+  res.json({ totalUsers: cnt.data().count, rooms: rooms.size, connections: io.sockets.sockets.size });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -260,20 +290,28 @@ app.get('/api/donations/:id/status', authMiddleware, async (req, res) => {
 
 // Confirma a doação a partir do evento de pagamento do Asaas (idempotente)
 async function confirmDonationFromAsaas(pay) {
+  // Compat.: pagamentos confirmados antes desta versão só têm asaasPaymentId na doação
   const dup = await db.collection('donations').where('asaasPaymentId', '==', pay.id).limit(1).get();
-  if (!dup.empty) return;                                   // evento repetido
-  const snap = await db.collection('donations').where('asaasQrId', '==', pay.pixQrCodeId).limit(1).get();
-  if (snap.empty) { console.log('Pix recebido sem doação associada:', pay.id); return; }
-  const doc = snap.docs[0], d = doc.data();
+  if (!dup.empty) return;
+  const qrSnap = await db.collection('donations').where('asaasQrId', '==', pay.pixQrCodeId).limit(1).get();
+  if (qrSnap.empty) { console.log('Pix recebido sem doação associada:', pay.id); return; }
+  const docRef = qrSnap.docs[0].ref;
+  const markRef = db.collection('asaasPayments').doc(String(pay.id));   // marcador de idempotência
   const value = Math.round(Number(pay.value) * 100) / 100;
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  if (d.status === 'pending' || (d.status === 'confirmed' && !d.asaasPaymentId)) {
-    await doc.ref.update({ status: 'confirmed', amount: value, asaasPaymentId: pay.id, confirmedAt: d.confirmedAt || now });
-  } else {                                                  // mesmo QR pago de novo → nova doação confirmada
-    await db.collection('donations').add({ ...d, amount: value, asaasPaymentId: pay.id, status: 'confirmed', createdAt: now, confirmedAt: now });
-  }
-  donCache.at = 0;
-  console.log(`💖 Doação confirmada: ${d.displayName} R$ ${value}`);
+  let name = null;
+  await db.runTransaction(async tx => {
+    const [mark, cur] = await Promise.all([tx.get(markRef), tx.get(docRef)]);
+    if (mark.exists || !cur.exists) return;                  // evento repetido/simultâneo
+    const d = cur.data(); name = d.displayName;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    if (d.status === 'pending' || (d.status === 'confirmed' && !d.asaasPaymentId)) {
+      tx.update(docRef, { status: 'confirmed', amount: value, asaasPaymentId: pay.id, confirmedAt: d.confirmedAt || now });
+    } else {                                                 // mesmo QR pago de novo → nova doação confirmada
+      tx.set(db.collection('donations').doc(), { ...d, amount: value, asaasPaymentId: pay.id, status: 'confirmed', createdAt: now, confirmedAt: now });
+    }
+    tx.set(markRef, { donationId: docRef.id, at: now });
+  });
+  if (name !== null) { donCache.at = 0; console.log(`💖 Doação confirmada: ${name} R$ ${value}`); }
 }
 
 // Webhook do Asaas (configure em Integrações > Webhooks, evento PAYMENT_RECEIVED)
@@ -284,7 +322,7 @@ app.post('/api/webhooks/asaas', async (req, res) => {
   if (!tok || A.length !== B.length || !crypto.timingSafeEqual(A, B)) return res.status(401).json({ error: 'unauthorized' });
   try {
     const ev = req.body?.event, pay = req.body?.payment;
-    if ((ev === 'PAYMENT_RECEIVED' || ev === 'PAYMENT_CONFIRMED') && pay?.pixQrCodeId && pay?.id) {
+    if (ev === 'PAYMENT_RECEIVED' && pay?.pixQrCodeId && pay?.id) {
       await confirmDonationFromAsaas(pay);
     }
     res.json({ received: true });
@@ -298,7 +336,8 @@ app.post('/api/webhooks/asaas', async (req, res) => {
 app.get('/api/donations/public', async (req, res) => {
   if (donCache.data && Date.now() - donCache.at < 60000) return res.json(donCache.data);
   try {
-    const snap = await db.collection('donations').where('status', '==', 'confirmed').limit(500).get();
+    const snap = await db.collection('donations').where('status', '==', 'confirmed')
+      .select('displayName', 'message', 'amount', 'showAmount', 'confirmedAt', 'avatarOk').limit(500).get();
     const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       .sort((a, b) => (b.confirmedAt?.toMillis?.() || 0) - (a.confirmedAt?.toMillis?.() || 0));
     const br = new Date(Date.now() - 3 * 60 * 60 * 1000);           // horário de Brasília
@@ -313,7 +352,7 @@ app.get('/api/donations/public', async (req, res) => {
       apoiadores: list.slice(0, 50).map(d => ({
         name: d.displayName, message: d.message || '',
         amount: d.showAmount ? d.amount : null,
-        avatarUrl: (d.avatar && d.avatarOk) ? '/api/donations/' + d.id + '/avatar' : null,
+        avatarUrl: d.avatarOk ? '/api/donations/' + d.id + '/avatar' : null,
       })),
     } };
     res.json(donCache.data);
@@ -626,6 +665,14 @@ function doPokerShowdown(room, roomId, io) {
 
 io.on('connection', socket => {
   const { uid, user } = socket.data;
+  // Qualquer erro (payload ausente/malformado, falha de DB) é logado e não derruba o servidor.
+  const _on = socket.on.bind(socket);
+  socket.on = (ev, fn) => _on(ev, (...args) => {
+    try {
+      const r = fn(...args);
+      if (r && typeof r.catch === 'function') r.catch(e => console.error('socket ' + ev + ' erro:', e.message));
+    } catch (e) { console.error('socket ' + ev + ' erro:', e.message); }
+  });
   console.log(`✅ Conectado: ${user?.name} (${uid})`);
 
   // Entra no lobby
@@ -645,20 +692,18 @@ io.on('connection', socket => {
     }
     // Cria a sala PRIMEIRO, debita fichas SÓ se tudo der certo
     const roomId = crypto.randomUUID().slice(0,8).toUpperCase();
-    rooms.set(roomId, {
+    rooms.set(roomId, makeRoom({
       id: roomId, game, betAmount, maxPlayers: max,
       players: [{ uid, name: user.name, avatar: user.avatar, ready: false, online: true }],
       status: 'waiting',
       createdAt: Date.now(),
-    });
+    }));
 
     socket.join(roomId);
 
     // Debita 5 fichas SOMENTE após confirmar que a sala foi criada com sucesso
     try {
-      await db.collection('users').doc(uid).update({
-        chips: admin.firestore.FieldValue.increment(-5)
-      });
+      if (!(await debitEntry(uid, 5))) throw new Error('saldo insuficiente');
     } catch(e) {
       // Se falhar o débito, remove a sala e avisa
       rooms.delete(roomId);
@@ -729,9 +774,7 @@ io.on('connection', socket => {
 
     // Debita 5 fichas SOMENTE após confirmar entrada com sucesso
     try {
-      await db.collection('users').doc(uid).update({
-        chips: admin.firestore.FieldValue.increment(-5)
-      });
+      if (!(await debitEntry(uid, 5))) throw new Error('saldo insuficiente');
     } catch(e) {
       // Se falhar débito, remove jogador da sala
       room.players = room.players.filter(p => p.uid !== uid);
@@ -812,7 +855,7 @@ io.on('connection', socket => {
 
   socket.on('vote_bet', ({ roomId, accept }) => {
     const room = rooms.get(roomId);
-    if (!room || !room.pendingBet) return;
+    if (!room || !room.pendingBet || !room.players.some(p => p.uid === uid)) return;
     room.pendingBet.votes[uid] = accept;
     const others = room.players.filter(p => p.uid !== room.players[0].uid);
     const allVoted = others.every(p => room.pendingBet.votes[p.uid] !== undefined);
@@ -1612,6 +1655,9 @@ io.on('connection', socket => {
     try {
       const room = rooms.get(roomId);
       if (!room || room.status !== 'playing') return;
+      if (!room.players.some(p => p.uid === uid)) return;   // só jogadores da sala
+      const inRoom = id => !id || room.players.some(p => p.uid === id);
+      if (!inRoom(winnerId) || !inRoom(loserId)) return;   // vencedor/perdedor precisam ser da sala
       room.status = 'finished';
 
       // Sem debito/credito aqui — as 5 fichas de entrada ja foram cobradas ao entrar na sala
@@ -1641,6 +1687,8 @@ io.on('connection', socket => {
 
   // ── Chat da sala ─────────────────────────────────────────
   socket.on('chat_message', ({ roomId, message }) => {
+    const room = rooms.get(roomId);
+    if (!room || !room.players.some(p => p.uid === uid) || typeof message !== 'string') return;
     const clean = message.slice(0, 120);
     io.to(roomId).emit('chat_message', {
       uid, name: user.name, message: clean, time: Date.now()
@@ -1648,6 +1696,8 @@ io.on('connection', socket => {
   });
 
   socket.on('chat_audio', ({ roomId, audio, mimeType }) => {
+    const _r = rooms.get(roomId);
+    if (!_r || !_r.players.some(p => p.uid === uid)) return;
     if (!audio || typeof audio !== 'string' || audio.length > 700000) return;
     if (!audio.startsWith('data:audio/')) return;
     io.to(roomId).emit('chat_audio', {
@@ -1842,6 +1892,17 @@ function getRoomsList() {
     }));
 }
 
+// Débito atômico: só debita se o saldo atual cobrir (evita saldo negativo em cliques simultâneos)
+async function debitEntry(uid, amount) {
+  const ref = db.collection('users').doc(uid);
+  return db.runTransaction(async tx => {
+    const snap = await tx.get(ref);
+    if ((snap.data()?.chips || 0) < amount) return false;
+    tx.update(ref, { chips: admin.firestore.FieldValue.increment(-amount) });
+    return true;
+  });
+}
+
 async function logTransaction(userId, type, chips, description) {
   await db.collection('transactions').add({
     userId, type, chips, description,
@@ -1849,9 +1910,12 @@ async function logTransaction(userId, type, chips, description) {
   });
 }
 
-// ── Health check ─────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ status: 'ok', rooms: rooms.size }));
 
 // ── Start ────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error('Erro Express:', err.message);
+  if (!res.headersSent) res.status(err.status || 500).json({ error: err.status === 400 ? 'Requisição inválida' : 'Erro interno' });
+});
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`🎰 Cassino Backend rodando na porta ${PORT}`));
