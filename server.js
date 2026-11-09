@@ -416,6 +416,15 @@ app.post('/api/admin/donations/:id/reject', adminAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// Admin: apaga a doação de vez (testes, erros). Não dá para desfazer.
+app.post('/api/admin/donations/:id/delete', adminAuth, async (req, res) => {
+  const ref = db.collection('donations').doc(req.params.id);
+  if (!(await ref.get()).exists) return res.status(404).json({ error: 'Não encontrado' });
+  await ref.delete();
+  donCache.at = 0;
+  res.json({ success: true });
+});
+
 // Admin: adiciona doação já confirmada (quem doou sem preencher o formulário)
 app.post('/api/admin/donations/manual', adminAuth, async (req, res) => {
   const displayName = cleanTxt(req.body.displayName, 30);
