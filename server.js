@@ -334,28 +334,35 @@ app.post('/api/webhooks/asaas', async (req, res) => {
 
 // Mural público: só doações confirmadas, sem dados pessoais além do nome escolhido
 app.get('/api/donations/public', async (req, res) => {
-  if (donCache.data && Date.now() - donCache.at < 60000) return res.json(donCache.data);
   try {
-    const snap = await db.collection('donations').where('status', '==', 'confirmed')
-      .select('displayName', 'message', 'amount', 'showAmount', 'confirmedAt', 'avatarOk').limit(500).get();
-    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .sort((a, b) => (b.confirmedAt?.toMillis?.() || 0) - (a.confirmedAt?.toMillis?.() || 0));
-    const br = new Date(Date.now() - 3 * 60 * 60 * 1000);           // horário de Brasília
-    const monthKey = br.getUTCFullYear() + '-' + br.getUTCMonth();
-    const totalMes = list.reduce((sum, d) => {
-      const t = new Date((d.confirmedAt?.toMillis?.() || 0) - 3 * 60 * 60 * 1000);
-      return t.getUTCFullYear() + '-' + t.getUTCMonth() === monthKey ? sum + (d.amount || 0) : sum;
-    }, 0);
-    donCache = { at: Date.now(), data: {
-      totalMes: Math.round(totalMes * 100) / 100,
-      total: list.length,
-      apoiadores: list.slice(0, 50).map(d => ({
-        name: d.displayName, message: d.message || '',
+    // Lista completa em cache (zerado a cada confirmação/rejeição); a paginação é feita em memória
+    if (!donCache.data || Date.now() - donCache.at >= 5 * 60 * 1000) {
+      const snap = await db.collection('donations').where('status', '==', 'confirmed')
+        .select('displayName', 'message', 'amount', 'showAmount', 'confirmedAt', 'avatarOk').limit(500).get();
+      const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (b.confirmedAt?.toMillis?.() || 0) - (a.confirmedAt?.toMillis?.() || 0));
+      const br = new Date(Date.now() - 3 * 60 * 60 * 1000);           // horário de Brasília
+      const monthKey = br.getUTCFullYear() + '-' + br.getUTCMonth();
+      const totalMes = list.reduce((sum, d) => {
+        const t = new Date((d.confirmedAt?.toMillis?.() || 0) - 3 * 60 * 60 * 1000);
+        return t.getUTCFullYear() + '-' + t.getUTCMonth() === monthKey ? sum + (d.amount || 0) : sum;
+      }, 0);
+      const pub = d => ({
+        id: d.id, name: d.displayName, message: d.message || '',
         amount: d.showAmount ? d.amount : null,
         avatarUrl: d.avatarOk ? '/api/donations/' + d.id + '/avatar' : null,
-      })),
-    } };
-    res.json(donCache.data);
+      });
+      // Ranking: só quem escolheu mostrar o valor e informou um nome (anônimos e valores ocultos ficam de fora)
+      const top = list.filter(d => d.showAmount && d.displayName && d.displayName !== 'Anônimo')
+        .sort((a, b) => (b.amount || 0) - (a.amount || 0)).slice(0, 5).map(pub);
+      donCache = { at: Date.now(), data: {
+        totalMes: Math.round(totalMes * 100) / 100, total: list.length, top, apoiadores: list.map(pub),
+      } };
+    }
+    const { totalMes, total, top, apoiadores } = donCache.data;
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 50);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+    res.json({ totalMes, total, top, apoiadores: apoiadores.slice(offset, offset + limit), hasMore: offset + limit < apoiadores.length });
   } catch (e) {
     console.error('donations public erro:', e.message);
     res.status(500).json({ error: 'Erro ao carregar mural' });
