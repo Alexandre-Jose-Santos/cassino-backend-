@@ -2,6 +2,7 @@
   "name": "cassiano-backend",
   "version": "1.0.0",
   "description": "Cassiano Casino Backend — Node.js + Socket.io + Firebase",
+  "license": "UNLICENSED",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
